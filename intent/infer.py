@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 
+from preprocess.io import read_records
+
 
 @dataclass
 class IntentMatch:
@@ -23,7 +25,7 @@ class IntentMatcher:
         self,
         model_path: str = "artifacts/intent_model",
         fallback_model_name: str = "BAAI/bge-small-en-v1.5",
-        data_paths: Iterable[str] = ("data/gold.json", "data/bronze.json"),
+        data_paths: Iterable[str] = ("data/Gold.jsonl", "data/Bronze.jsonl"),
         threshold: float = 0.85,
     ) -> None:
         model_source = model_path if Path(model_path).exists() else fallback_model_name
@@ -37,7 +39,7 @@ class IntentMatcher:
         for data_path in data_paths:
             path = Path(data_path)
             if path.exists():
-                frame = pd.read_json(path)
+                frame = read_records(path)
                 if not frame.empty:
                     frames.append(frame)
         if not frames:

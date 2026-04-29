@@ -1,0 +1,11 @@
+alpha: 0.55
+beta: 0.35
+gamma: 0.10
+similarity_model: sentence-transformers/all-MiniLM-L6-v2
+llama_model_path: meta-llama/Meta-Llama-3-8B
+chunk_size: 1000
+sim_batch_size: 128
+ppl_batch_size: 2
+max_length: 2048
+gold_ratio: 0.10
+num_workers: 0

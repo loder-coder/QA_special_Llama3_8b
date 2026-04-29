@@ -6,6 +6,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+from security.language_policy import language_instruction, normalize_language
+
 
 @dataclass
 class GenerationConfig:
@@ -68,11 +70,13 @@ class LlamaAnswerGenerator:
         )
 
     @staticmethod
-    def build_user_prompt(question: str, context: str = "", category: str = "") -> str:
+    def build_user_prompt(question: str, context: str = "", category: str = "", language: str = "ko") -> str:
         context_block = LlamaAnswerGenerator._escape_prompt_section(context) if context.strip() else "참고 문서 없음"
         category_block = LlamaAnswerGenerator._escape_prompt_section(category) if category.strip() else "일반"
         question_block = LlamaAnswerGenerator._escape_prompt_section(question)
+        normalized_language = normalize_language(language)
         return (
+            f"[응답 언어]\n{language_instruction(normalized_language)}\n\n"
             f"[카테고리]\n{category_block}\n\n"
             f"[참고 문서]\n<<<CONTEXT\n{context_block}\nCONTEXT>>>\n\n"
             f"[질문]\n<<<QUESTION\n{question_block}\nQUESTION>>>\n\n"
@@ -80,13 +84,25 @@ class LlamaAnswerGenerator:
         )
 
     @staticmethod
-    def build_prompt(question: str, context: str = "", category: str = "") -> str:
-        user_prompt = LlamaAnswerGenerator.build_user_prompt(question=question, context=context, category=category)
+    def build_prompt(question: str, context: str = "", category: str = "", language: str = "ko") -> str:
+        user_prompt = LlamaAnswerGenerator.build_user_prompt(
+            question=question,
+            context=context,
+            category=category,
+            language=language,
+        )
         return f"{LlamaAnswerGenerator.SYSTEM_PROMPT}\n{user_prompt}"
 
-    def generate(self, question: str, context: str = "", category: str = "", config: GenerationConfig | None = None) -> str:
+    def generate(
+        self,
+        question: str,
+        context: str = "",
+        category: str = "",
+        language: str = "ko",
+        config: GenerationConfig | None = None,
+    ) -> str:
         generation_config = config or GenerationConfig()
-        prompt = self.build_prompt(question=question, context=context, category=category)
+        prompt = self.build_prompt(question=question, context=context, category=category, language=language)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         with torch.no_grad():

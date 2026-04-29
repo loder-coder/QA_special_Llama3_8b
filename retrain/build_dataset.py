@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from preprocess.io import read_records
 from security.prompt_guard import is_prompt_injection
 from security.sensitive_filter import contains_sensitive_data
 
@@ -13,7 +14,7 @@ from security.sensitive_filter import contains_sensitive_data
 def collect_failed_queries(log_path: str = "logs/qa.jsonl") -> pd.DataFrame:
     path = Path(log_path)
     if not path.exists():
-        return pd.DataFrame(columns=["query", "answer", "source", "success", "sensitive_data_detected"])
+        return pd.DataFrame(columns=["query", "answer", "source", "success", "language", "sensitive_data_detected"])
 
     rows = []
     with path.open("r", encoding="utf-8") as file:
@@ -28,6 +29,7 @@ def collect_failed_queries(log_path: str = "logs/qa.jsonl") -> pd.DataFrame:
                         "answer": payload.get("answer", ""),
                         "source": payload.get("source", ""),
                         "success": payload.get("success", False),
+                        "language": payload.get("language", "ko"),
                         "sensitive_data_detected": payload.get("sensitive_data_detected", False),
                     }
                 )
@@ -41,13 +43,14 @@ def build_review_candidates(
 ) -> pd.DataFrame:
     failed = collect_failed_queries(log_path)
     if failed.empty:
-        candidates = pd.DataFrame(columns=["query", "count", "latest_answer", "source", "needs_manual_answer", "approved"])
+        candidates = pd.DataFrame(columns=["query", "language", "count", "latest_answer", "source", "needs_manual_answer", "approved"])
         candidates.to_json(output_path, orient="records", force_ascii=False, indent=2)
         return candidates
 
     filtered = failed.copy()
     filtered["query"] = filtered["query"].astype(str).str.strip()
     filtered["answer"] = filtered["answer"].astype(str).str.strip()
+    filtered["language"] = filtered["language"].astype(str).str.strip()
     filtered = filtered[filtered["query"].str.len() >= min_query_length]
     filtered = filtered[~filtered["query"].map(is_prompt_injection)]
     filtered = filtered[~filtered["query"].map(contains_sensitive_data)]
@@ -55,27 +58,29 @@ def build_review_candidates(
     if "sensitive_data_detected" in filtered.columns:
         filtered = filtered[filtered["sensitive_data_detected"] != True]
     if filtered.empty:
-        candidates = pd.DataFrame(columns=["query", "count", "latest_answer", "source", "needs_manual_answer", "approved"])
+        candidates = pd.DataFrame(columns=["query", "language", "count", "latest_answer", "source", "needs_manual_answer", "approved"])
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         candidates.to_json(output_path, orient="records", force_ascii=False, indent=2)
         return candidates
 
-    counts = Counter(filtered["query"].tolist())
-    latest_answer: dict[str, str] = {}
-    latest_source: dict[str, str] = {}
+    counts = Counter((row["query"], row["language"]) for row in filtered.to_dict("records"))
+    latest_answer: dict[tuple[str, str], str] = {}
+    latest_source: dict[tuple[str, str], str] = {}
     for row in filtered.to_dict("records"):
-        latest_answer[row["query"]] = row["answer"]
-        latest_source[row["query"]] = row["source"]
+        key = (row["query"], row["language"])
+        latest_answer[key] = row["answer"]
+        latest_source[key] = row["source"]
 
     rows = []
-    for query, count in counts.items():
-        answer = latest_answer.get(query, "")
+    for (query, language), count in counts.items():
+        answer = latest_answer.get((query, language), "")
         rows.append(
             {
                 "query": query,
+                "language": language,
                 "count": count,
                 "latest_answer": answer,
-                "source": latest_source.get(query, ""),
+                "source": latest_source.get((query, language), ""),
                 "needs_manual_answer": not bool(answer),
                 "approved": False,
             }
@@ -89,17 +94,17 @@ def build_review_candidates(
 
 def add_approved_queries_to_gold(
     approved_path: str = "data/retrain_approved.json",
-    gold_path: str = "data/gold.json",
-    output_path: str = "data/gold.json",
+    gold_path: str = "data/Gold.jsonl",
+    output_path: str = "data/Gold.jsonl",
 ) -> pd.DataFrame:
     approved_file = Path(approved_path)
     gold_file = Path(gold_path)
-    gold = pd.read_json(gold_file) if gold_file.exists() else pd.DataFrame()
+    gold = read_records(gold_file) if gold_file.exists() else pd.DataFrame()
 
     if not approved_file.exists():
         return gold
 
-    approved = pd.read_json(approved_file)
+    approved = read_records(approved_file)
     if approved.empty:
         return gold
 
@@ -138,7 +143,10 @@ def add_approved_queries_to_gold(
         gold = gold.drop_duplicates(subset=["question"]).reset_index(drop=True)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    gold.to_json(output_path, orient="records", force_ascii=False, indent=2)
+    if Path(output_path).suffix.lower() == ".jsonl":
+        gold.to_json(output_path, orient="records", force_ascii=False, lines=True)
+    else:
+        gold.to_json(output_path, orient="records", force_ascii=False, indent=2)
     return gold
 
 

@@ -1,25 +1,77 @@
-# Hybrid Q&A System Runbook
+# Hybrid Q&A System Tutorial Runbook
 
-이 문서는 현재 로컬 환경에서 즉시 실행할 수 없다는 전제를 포함한 실행 절차입니다.
+이 문서는 `altong_ai`를 로컬 싱글 노드 AI 서버로 실행하는 순서형 튜토리얼입니다.
 
-## 1. Prerequisites
+목표 구조:
+
+```text
+Spring Boot Backend
+  -> Internal IP JSON API
+  -> FastAPI /ask
+  -> Redis localhost cache
+  -> RAG / FAISS
+  -> LLM / LoRA model
+  -> JSON answer
+```
+
+Git에 올리지 않는 데이터, artifact, hash manifest, secret 보관 기준은 `PORTABLE_INDEX.md`를 따릅니다.
+
+## 0. What This Project Does
+
+`/ask` API에 JSON으로 질문을 보내면 답변 JSON을 돌려줍니다.
+
+요청:
+
+```json
+{
+  "q": "질문내용",
+  "language": "ko"
+}
+```
+
+응답:
+
+```json
+{
+  "answer": "답변내용",
+  "success": true,
+  "source": "llm",
+  "intent_similarity": 0.0,
+  "rag_similarity": 0.82,
+  "language": "ko"
+}
+```
+
+지원 언어:
+
+```text
+ko, en, ja, zh, vi
+```
+
+## 1. First-Time Setup
+
+### 1.1 Required Tools
+
+필요한 것:
 
 - Python 3.10 이상
-- Redis 서버
-- HuggingFace 계정 및 토큰
+- Redis
+- HuggingFace 계정과 token
 - `meta-llama/Llama-3-8b` 접근 권한
 - 충분한 디스크 공간
-- LoRA/QLoRA 학습용 CUDA GPU 권장
+- LoRA/QLoRA 학습을 하려면 CUDA GPU 권장
 
-현재 코드에는 다음 외부 의존성이 있습니다.
+확인:
 
-- HuggingFace 모델 다운로드
-- SentenceTransformer 모델 다운로드
-- FAISS CPU index 생성
-- Redis 접속
-- LLaMA 3 base model 및 LoRA adapter 로딩
+```powershell
+python --version
+```
 
-## 2. Environment Setup
+실패하면 Python 설치 또는 PATH 설정이 먼저 필요합니다.
+
+### 1.2 Python Environment
+
+프로젝트 폴더에서 실행합니다.
 
 ```powershell
 python -m venv .venv
@@ -27,86 +79,174 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-HuggingFace 로그인이 필요한 경우:
+재현 가능한 설치가 필요하면:
+
+```powershell
+pip install -r requirements.lock
+```
+
+### 1.3 HuggingFace Login
+
+LLaMA 모델 다운로드 권한이 필요합니다.
 
 ```powershell
 huggingface-cli login
 ```
 
-Redis 예시:
+토큰은 Git에 올리지 않습니다.
+
+### 1.4 Redis Start
+
+Docker가 있으면:
 
 ```powershell
 docker run --name qa-redis -p 6379:6379 -d redis:7
 ```
 
-필요하면 환경 변수를 지정합니다.
+이미 만든 컨테이너가 있으면:
+
+```powershell
+docker start qa-redis
+```
+
+Redis는 AI 서버 내부에서만 쓰는 전제입니다.
+
+## 2. Environment Variables
+
+서버 실행 전에 PowerShell에 설정합니다.
 
 ```powershell
 $env:REDIS_URL = "redis://localhost:6379/0"
+$env:ALTONG_API_KEY = "local-secret-key"
+$env:ALTONG_RATE_LIMIT_PER_MINUTE = "60"
 ```
 
-## 3. Data Preparation
+임시 로컬 테스트에서 API key 검사를 끄고 싶을 때만 사용합니다.
 
-`data/raw.json`은 다음 형식의 배열이어야 합니다.
+```powershell
+$env:ALTONG_ALLOW_UNAUTHENTICATED_LOCAL = "true"
+```
+
+운영에서는 `ALTONG_ALLOW_UNAUTHENTICATED_LOCAL`을 사용하지 않습니다.
+
+## 3. Prepare Data
+
+### 3.1 Raw Data Shape
+
+`data/raw.json`은 배열이어야 합니다.
+
+실제 운영 데이터는 Git에 올리지 않고 `PORTABLE_INDEX.md` 기준으로 보관합니다.
 
 ```json
 [
   {
     "id": "q_0001",
-    "question": "question text",
-    "answer": "answer text",
-    "category": "category",
+    "question": "사용자 질문 원문",
+    "answer": "기준 답변 본문",
+    "category": "질문 카테고리",
     "views": 100,
     "donation": 50
   }
 ]
 ```
 
-### 3.1 Raw 데이터 정제 body 설정
-
-정제 대상 raw item은 아래 필드를 반드시 포함해야 합니다. 현재 전처리 코드는 이 필드명을 기준으로 pandas DataFrame을 만들고, 누락된 필드가 있으면 오류를 발생시킵니다.
-
-```json
-{
-  "id": "q_0001",
-  "question": "사용자 질문 원문",
-  "answer": "채택 또는 기준 답변 본문",
-  "category": "질문 카테고리",
-  "views": 100,
-  "donation": 50
-}
-```
-
 필드 의미:
 
 - `id`: 질문 고유 ID
-- `question`: 유사 질문 탐지와 intent 학습에 사용할 질문 텍스트
-- `answer`: LLM fine-tuning과 RAG 문서에 사용할 답변 본문
-- `category`: prompt의 `[카테고리]` 영역에 들어갈 분류값
-- `views`: 점수 계산에 사용할 조회수
-- `donation`: 점수 계산에 사용할 후원/가치 점수
+- `question`: 유사 질문 탐지와 intent 학습에 사용할 질문
+- `answer`: RAG와 LLM 학습에 사용할 답변
+- `category`: 답변 생성 prompt의 분류값
+- `views`: 점수 계산용 조회수
+- `donation`: 점수 계산용 가치 점수
 
-### 3.2 데이터 정제 방법
-
-전처리 실행:
+### 3.2 Clean Raw Data
 
 ```powershell
 python -m preprocess.pipeline
 ```
 
-정제 기준:
+결과:
 
-- `question`, `answer`, `category`의 HTML tag와 중복 공백 제거
-- `answer` 길이가 20자 미만이면 제거
-- `몰라요`, `모름`, `없음`, `테스트`, `asdf`, 반복 문자 등 의미 없는 답변 제거
-- `views`, `donation`을 숫자로 변환하고 실패 시 `0` 처리
-- `score = views * 0.3 + donation * 0.7` 계산
-- SBERT 기준 질문 유사도 `0.9` 초과 중복 질문 제거
-- score 상위 30%를 `data/gold.json`, 나머지를 `data/bronze.json`으로 저장
+```text
+data/Gold.jsonl
+data/Bronze.jsonl
+data/report.txt
+data/preprocess_checkpoint.json
+```
 
-### 3.3 데이터 정제 이후 실행 순서
+정제 과정:
 
-정제 이후에는 아래 순서로 학습/인덱싱 artifact를 생성합니다.
+- HTML tag 제거
+- 중복 공백 제거
+- 20자 미만 또는 1000자 초과 답변은 제거하지 않고 `Length_Penalty`로 감점
+- 의미 없는 답변 제거
+- `views`, `donation` 숫자화
+- 점수 계산
+- 유사 질문 중복 제거
+- 상위 데이터는 `gold`, 나머지는 `bronze`로 분리
+
+Q_score preprocessing additions:
+
+- null, empty string, control-character, special-character-only row drop
+- streaming chunk processing for large JSON / JSONL input
+- CPU multiprocessing for cleaning chunks
+- Q_score = alpha * Sim(Q, A) + beta * (1/PPL) + gamma * Length_Penalty
+- top 10 percent -> `Gold.jsonl`, remainder -> `Bronze.jsonl`
+- checkpoint resume through `data/preprocess_checkpoint.json`
+
+Q_score weights are not fixed in code. Set them in `preprocess/scoring_config.yaml` or override them with environment variables:
+
+```powershell
+$env:ALTONG_SCORING_ALPHA = "0.55"
+$env:ALTONG_SCORING_BETA = "0.35"
+$env:ALTONG_SCORING_GAMMA = "0.10"
+$env:ALTONG_SCORING_LLAMA_MODEL_PATH = "C:\models\Llama-3-8B"
+```
+
+### 3.3 What Changed In Plain Language
+
+이번 전처리 변경은 "좋은 학습 데이터와 참고용 데이터를 자동으로 나누는 작업"입니다.
+
+예전 방식은 조회수(`views`)와 후원값(`donation`)처럼 숫자로 된 인기도를 보고 데이터를 나눴습니다. 새 방식은 질문과 답변의 실제 품질을 더 많이 봅니다. 즉, 사람들이 많이 본 글인지보다 "질문과 답변이 서로 잘 맞는지", "답변 문장이 자연스러운지", "답변 길이가 너무 짧거나 너무 길지 않은지"를 점수로 계산합니다.
+
+새 점수는 `Q_score`라고 부릅니다.
+
+```text
+Q_score = 질문-답변 유사도 + 답변 자연스러움 + 답변 길이 점수
+```
+
+각 항목의 의미는 다음과 같습니다.
+
+- `Sim(Q, A)`: 질문과 답변이 얼마나 잘 맞는지 보는 점수입니다. 예를 들어 "비밀번호를 잊었어요"라는 질문에 "비밀번호 재설정 방법"을 답하면 높고, 전혀 다른 답변이면 낮습니다.
+- `1/PPL`: 답변 문장이 얼마나 자연스러운지 보는 점수입니다. Llama 3 모델이 읽었을 때 어색하고 이상한 문장일수록 점수가 낮아집니다.
+- `Length_Penalty`: 답변 길이에 대한 감점입니다. 20자 미만이면 너무 짧다고 보고 감점하고, 1000자를 넘으면 너무 길다고 보고 감점합니다.
+
+최종 결과 파일은 이렇게 나뉩니다.
+
+- `data/Gold.jsonl`: 점수가 높은 상위 10% 데이터입니다. LoRA 학습에 우선 사용합니다.
+- `data/Bronze.jsonl`: 나머지 데이터입니다. RAG 검색 인덱스에 넣어 참고 문서처럼 사용합니다.
+- `data/report.txt`: Gold와 Bronze가 각각 몇 개이고, 평균 점수와 최소/최대 점수가 얼마인지 보여주는 요약 보고서입니다.
+- `data/preprocess_checkpoint.json`: 중간 저장 파일입니다. 1.5GB처럼 큰 파일을 처리하다가 중간에 멈춰도 처음부터 다시 하지 않도록 도와줍니다.
+- `data/scored.jsonl`: 점수 계산이 끝난 전체 중간 결과입니다. 최종 분리 전 임시 결과로 보면 됩니다.
+
+대용량 데이터를 안전하게 처리하기 위해 한 번에 전체 파일을 메모리에 올리지 않습니다. 큰 박스를 한꺼번에 들지 않고 작은 묶음으로 나눠 옮기는 것처럼, JSON 데이터를 chunk 단위로 조금씩 읽고 처리합니다.
+
+정제 중 아래 데이터는 학습 오류를 만들 수 있으므로 점수 계산 전에 제외합니다.
+
+- 질문이나 답변이 비어 있는 데이터
+- `null` 값이 들어 있는 데이터
+- 제어 문자처럼 학습에 방해되는 문자가 들어 있는 데이터
+- 특수문자만 있고 실제 글자나 숫자가 없는 데이터
+
+`alpha`, `beta`, `gamma`는 점수 계산에서 어떤 항목을 더 중요하게 볼지 정하는 비율입니다. 코드에 고정하지 않고 `preprocess/scoring_config.yaml` 또는 환경 변수로 바꿀 수 있습니다.
+
+- `alpha`를 키우면 질문과 답변이 서로 맞는지를 더 중요하게 봅니다.
+- `beta`를 키우면 답변 문장의 자연스러움을 더 중요하게 봅니다.
+- `gamma`를 키우면 답변 길이가 적절한지를 더 중요하게 봅니다.
+
+## 4. Build Training And Search Artifacts
+
+아래 순서대로 실행합니다.
 
 ```powershell
 python -m preprocess.build_pairs
@@ -116,118 +256,305 @@ python -m rag.embed
 python -m model.train_lora
 ```
 
-순서 의미:
+각 단계 의미:
 
-- `build_pairs`: gold 질문 간 positive/negative pair 생성
-- `build_triplet`: intent 학습용 anchor/positive/negative triplet 생성
-- `intent.train`: Q-Q intent 모델 저장
-- `rag.embed`: RAG 전용 bge-base embedding과 FAISS index 생성
-- `model.train_lora`: bronze 학습 후 gold를 이어서 학습하는 QLoRA adapter 생성
+- `preprocess.build_pairs`: intent 학습용 질문 pair 생성
+- `preprocess.build_triplet`: intent 학습용 triplet 생성
+- `intent.train`: 유사 질문 판단 모델 생성
+- `rag.embed`: FAISS index와 metadata 생성
+- `model.train_lora`: LLaMA LoRA adapter 학습
 
-## 4. Full Pipeline Build Order
+주요 결과:
 
-전체를 처음부터 실행하는 경우 아래 순서로 실행합니다.
-
-```powershell
-python -m preprocess.pipeline
-python -m preprocess.build_pairs
-python -m preprocess.build_triplet
-python -m intent.train
-python -m rag.embed
-python -m model.train_lora
+```text
+data/pairs.json
+data/triplets.json
+artifacts/intent_model
+artifacts/rag/faiss.index
+artifacts/rag/metadata.json
+artifacts/llama_lora
 ```
 
-각 단계 결과:
+생성된 `data/`, `artifacts/`, logs, hash manifest 보관 기준은 `PORTABLE_INDEX.md`를 따릅니다.
 
-- `preprocess.pipeline`: `data/gold.json`, `data/bronze.json`
-- `preprocess.build_pairs`: `data/pairs.json`
-- `preprocess.build_triplet`: `data/triplets.json`
-- `intent.train`: `artifacts/intent_model`
-- `rag.embed`: `artifacts/rag/faiss.index`, `artifacts/rag/metadata.json`
-- `model.train_lora`: `artifacts/llama_lora`
+## 5. Start API Server
 
-## 5. API Server
+모든 artifact가 준비된 뒤 서버를 실행합니다.
 
-모든 artifact가 생성된 뒤 실행합니다.
+로컬 테스트:
+
+```powershell
+uvicorn api.server:app --host 127.0.0.1 --port 8000
+```
+
+Spring Boot가 사내 내부망에서 호출해야 하면 AI 서버 내부 IP로 열 수 있습니다.
 
 ```powershell
 uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
-요청:
+이 경우 Windows 방화벽 또는 사내 방화벽에서 Spring Boot 서버 IP만 `8000` 포트 접근을 허용해야 합니다.
+
+## 6. Use The Model
+
+### 6.1 PowerShell Test
 
 ```powershell
 Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8000/ask" `
+  -Headers @{"X-API-Key"="local-secret-key"} `
   -ContentType "application/json" `
-  -Body '{"q":"질문내용"}'
+  -Body '{"q":"질문내용","language":"ko"}'
 ```
 
-HTTP body:
+영어 답변 요청:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8000/ask" `
+  -Headers @{"X-API-Key"="local-secret-key"} `
+  -ContentType "application/json" `
+  -Body '{"q":"How do I use this service?","language":"en"}'
+```
+
+베트남어 답변 요청:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8000/ask" `
+  -Headers @{"X-API-Key"="local-secret-key"} `
+  -ContentType "application/json" `
+  -Body '{"q":"Cach su dung dich vu nay?","language":"vi"}'
+```
+
+### 6.2 Spring Boot Call Shape
+
+Spring Boot에서는 AI 서버 내부 IP로 JSON POST를 보냅니다.
+
+```text
+POST http://10.x.x.x:8000/ask
+Header: X-API-Key: <ALTONG_API_KEY>
+Content-Type: application/json
+```
+
+Body:
 
 ```json
 {
-  "q": "질문내용"
+  "q": "질문내용",
+  "language": "ko"
 }
 ```
 
-### 5.1 Runtime Query Flow
+외부 공개 DNS보다 사내 내부 IP 또는 내부 DNS를 우선합니다.
 
-현재 `/ask` 요청 처리 순서:
+## 7. Runtime Flow
 
-1. Prompt injection 패턴 검사
-2. Redis exact match 확인
-3. Redis에 저장된 기존 질문들과 intent similarity 계산
-4. similarity `> 0.9`이면 Redis의 기존 답변 재사용
-5. 그 외에는 RAG 검색
-6. RAG similarity `< 0.7`이면 빈 context로 LLM 호출
-7. LLM 답변 생성
-8. 생성된 질문/답변을 Redis에 저장
-9. 요청/응답 로그 저장
+`/ask` 요청은 아래 순서로 처리됩니다.
 
-이 구조의 목적은 LLM 호출을 최대한 줄이는 것입니다.
+```text
+1. API key 검사
+2. rate limit 검사
+3. q 길이 검증
+4. language 정규화
+5. prompt injection 의심 패턴 차단
+6. Redis exact cache 확인
+7. Redis semantic cache 확인
+8. RAG 검색
+9. LLM 답변 생성
+10. output validation
+11. Redis cache 저장
+12. logs/qa.jsonl 기록
+```
 
-### 5.2 Traffic Assumption
+캐시 우선순위:
 
-현재 기준:
+```text
+exact cache -> semantic cache -> RAG + LLM
+```
 
-- 피크 시 동시 요청: 50~100
-- 예상 처리량: QPS 30~80
-- 배포 형태: 로컬 싱글 노드
+언어별 캐시는 분리됩니다. 같은 질문이라도 `ko`와 `en`은 다른 캐시로 저장됩니다.
 
-로컬 싱글 노드에서 주의할 점:
+## 8. Debug Tutorial
 
-- Redis exact cache hit는 가장 빠릅니다.
-- Redis semantic cache는 Redis에 저장된 질문 수가 많아질수록 SBERT similarity 계산 비용이 증가합니다.
-- QPS 30~80을 안정적으로 처리하려면 Redis cache hit 비율을 높이고, LLM 호출 비율을 낮게 유지해야 합니다.
-- LLM 호출이 많아지면 단일 노드에서 병목은 API가 아니라 GPU/모델 inference가 됩니다.
-- 운영 전에는 캐시 hit ratio, 평균 latency, LLM 호출 비율을 로그로 확인해야 합니다.
+### 8.1 Python Command Not Found
 
-## 6. Retraining Dataset
+증상:
 
-실패 로그에서 검수 후보를 만들려면:
+```text
+Python was not found
+```
+
+확인:
+
+```powershell
+python --version
+```
+
+해결:
+
+- Python 설치
+- PATH 설정
+- Windows App Execution Alias 비활성화 확인
+
+### 8.2 Redis Connection Error
+
+증상:
+
+```text
+Connection refused
+Error connecting to Redis
+```
+
+확인:
+
+```powershell
+docker ps
+```
+
+해결:
+
+```powershell
+docker start qa-redis
+$env:REDIS_URL = "redis://localhost:6379/0"
+```
+
+### 8.3 API Key Error
+
+증상:
+
+```text
+401 invalid api key
+503 api key is not configured
+```
+
+확인:
+
+```powershell
+$env:ALTONG_API_KEY
+```
+
+해결:
+
+```powershell
+$env:ALTONG_API_KEY = "local-secret-key"
+```
+
+요청 header에도 같은 값을 넣습니다.
+
+```text
+X-API-Key: local-secret-key
+```
+
+### 8.4 FAISS Index Missing
+
+증상:
+
+```text
+RAG index files are missing. Run rag/embed.py first.
+```
+
+해결:
+
+```powershell
+python -m rag.embed
+```
+
+그래도 실패하면 `data/Gold.jsonl`, `data/Bronze.jsonl`이 있는지 확인합니다.
+
+### 8.5 LoRA Adapter Missing
+
+증상:
+
+```text
+artifacts/llama_lora not found
+```
+
+해결:
+
+```powershell
+python -m model.train_lora
+```
+
+모델 접근 권한 또는 GPU/메모리 문제가 있을 수 있습니다.
+
+### 8.6 HuggingFace Model Download Error
+
+확인:
+
+```powershell
+huggingface-cli login
+```
+
+점검:
+
+- HuggingFace token이 맞는지
+- `meta-llama/Llama-3-8b` 접근 권한이 있는지
+- 인터넷 연결이 되는지
+
+### 8.7 Output Blocked
+
+응답 source가 아래처럼 나오면:
+
+```json
+{
+  "source": "output_blocked",
+  "success": false
+}
+```
+
+의미:
+
+- LLM 답변에 내부 prompt 표식 또는 금칙 문구가 섞였습니다.
+- 답변을 사용자에게 보내지 않고 차단한 상태입니다.
+
+확인:
+
+```text
+logs/qa.jsonl
+```
+
+민감정보는 `[REDACTED]`로 마스킹됩니다.
+
+## 9. Retraining Tutorial
+
+운영 중 실패 로그를 모아 재학습 후보를 만들 수 있습니다.
+
+### 9.1 Build Review Candidates
 
 ```powershell
 python -m retrain.build_dataset
 ```
 
-생성 결과:
+결과:
 
 ```text
 data/retrain_candidates.json
 ```
 
-semi-auto 기준:
+자동 제외:
 
-- 자동: 로그 수집
-- 자동: prompt injection 의심 query 필터링
-- 자동: 짧은 query 제거
-- 자동: query 빈도 기준 정렬
-- 수동: 사람이 `approved=true`, `answer`, `category`를 최종 확정
-- 수동 승인 후: `data/retrain_approved.json`으로 저장
+- prompt injection 의심 query
+- 민감정보 포함 query/answer
+- 너무 짧은 query
+- `sensitive_data_detected=true` 로그
 
-승인된 데이터만 gold dataset에 반영하려면 Python에서 다음 함수를 호출합니다.
+### 9.2 Manual Approval
+
+사람이 후보를 검토하고 승인 파일을 만듭니다.
+
+```text
+data/retrain_approved.json
+```
+
+승인된 item에는 사람이 확정한 답변과 `approved=true`가 있어야 합니다.
+
+### 9.3 Add Approved Data To Gold
+
+Python 환경에서 실행합니다.
 
 ```python
 from retrain.build_dataset import add_approved_queries_to_gold
@@ -235,80 +562,100 @@ from retrain.build_dataset import add_approved_queries_to_gold
 add_approved_queries_to_gold()
 ```
 
-로그 파일:
+주의:
+
+- 실패 로그를 자동으로 `gold`에 넣지 않습니다.
+- 최종 승인은 반드시 사람이 합니다.
+- 웹 검색 결과를 학습 데이터로 넣을 때는 출처와 검증 여부를 따로 확인합니다.
+
+## 10. Security Notes
+
+현재 적용된 방어:
+
+- POST JSON body 사용
+- `q` 길이 제한
+- API key 검사
+- 단일 프로세스 rate limit
+- prompt injection 입력 차단
+- system prompt와 사용자 데이터 영역 분리
+- output validation
+- 로그 민감정보 마스킹
+- 언어별 Redis cache 분리
+
+아직 주의할 점:
+
+- prompt injection 방어는 완전 차단이 아닙니다.
+- Redis는 로컬 내부 사용 전제입니다.
+- FAISS artifact hash 검증은 아직 코드에 없습니다.
+- rate limit은 메모리 기반이라 다중 worker에서는 공유되지 않습니다.
+- 웹 검색 확장은 아직 별도 구현이 필요합니다.
+
+외부 공개보다 사내 내부 IP 연결을 우선합니다.
+
+## 11. File Policy
+
+Git에 올리는 것:
 
 ```text
-logs/qa.jsonl
+source code
+requirements.txt
+requirements.lock
+RUNBOOK.md
+IMPROVEMENTS.md
+PORTABLE_INDEX.md
+.gitignore
 ```
 
-### 6.1 Retraining Period
+Git 밖에 두는 것:
 
-현재 트래픽 기준(QPS 30~80, 피크 동시 요청 50~100)에서는 재학습 주기를 아래처럼 잡는 것이 현실적입니다.
-
-- 초기 운영 1개월: 주 1회 후보 생성, 사람이 승인한 데이터만 반영
-- 안정화 이후: 2주 1회 또는 월 1회
-- 장애/오답이 급증한 경우: 즉시 후보 생성 후 수동 승인
-
-자동 수집된 로그를 바로 gold에 넣으면 데이터 poisoning 위험이 있습니다. 따라서 최종 승인 단계는 반드시 수동으로 유지합니다.
-
-## 7. Expected Failure Points
-
-- `python` 명령이 없으면 Python 설치 또는 PATH 설정이 필요합니다.
-- Redis가 실행 중이 아니면 `/ask` 요청 전에 cache 초기화 또는 조회에서 실패합니다.
-- FAISS index가 없으면 API 시작 시 RAG retriever 초기화가 실패합니다.
-- `artifacts/llama_lora`가 없으면 LoRA adapter 로딩이 실패합니다.
-- LLaMA 3 접근 권한이 없으면 모델 다운로드가 실패합니다.
-- `bitsandbytes`는 Windows/CPU 환경에서 동작이 제한될 수 있습니다.
-- `data/raw.json`이 비어 있으면 학습 데이터 생성 단계가 빈 결과를 만들 수 있습니다.
-
-## 8. Local Review Caveat
-
-현재 로컬에서 Python 실행기가 감지되지 않아 문법 컴파일, import 검증, API 기동 검증은 수행하지 못했습니다. 이 문서는 정적 코드 리뷰 기준의 실행 절차입니다.
-
-## 9. Local Single Node Security Notes
-
-현재 기준은 로컬 싱글 노드 실행입니다. 이 전제에서 우선 적용한 개선점:
-
-- `/ask`를 GET query string에서 POST JSON body로 변경해 질문이 URL, 브라우저 history, 프록시 access log에 남는 위험을 줄였습니다.
-- 요청 body의 `q`에 `min_length=1`, `max_length=2000` 제한을 추가했습니다.
-- `ignore previous instructions` 같은 prompt injection 의심 패턴은 LLM 호출 전에 차단합니다.
-- LLM prompt에 `[참고 문서]`와 `[질문]`을 신뢰할 수 없는 데이터로 선언하는 인젝션 방어 지시를 추가했습니다.
-- 사용자 질문과 검색 context는 `<<<CONTEXT ... CONTEXT>>>`, `<<<QUESTION ... QUESTION>>>` 경계 안에 넣어 시스템 지시와 데이터 영역을 분리했습니다.
-- 데이터 영역 안에 들어온 `[카테고리]`, `[참고 문서]`, `[질문]`, `[답변]` label은 일반 문자열 label로 치환합니다.
-- Redis exact cache와 Redis semantic cache를 사용해 LLM 호출 빈도를 줄입니다.
-
-로컬 싱글 노드에서 아직 남아 있는 취약점:
-
-- Redis는 기본값이 `redis://localhost:6379/0`이며 인증/TLS가 강제되지 않습니다. 로컬 외부에 노출하지 않는 전제입니다.
-- `logs/qa.jsonl`에는 재학습 후보 분석을 위해 query와 answer를 저장하지만, 민감정보 패턴은 `[REDACTED]`로 마스킹하고 `sensitive_data_detected=true` 로그는 재학습 후보에서 제외합니다.
-- FAISS index와 metadata 파일의 무결성 검증은 없습니다. 로컬 artifact 디렉터리 접근 권한을 제한해야 합니다.
-- prompt injection 방어는 완화책이며 완전 차단이 아닙니다. 현재는 입력 금칙 패턴 탐지, system prompt 분리, output validation을 적용했습니다. 운영 전에는 실제 공격 로그 기준으로 패턴을 계속 보강해야 합니다.
-- API는 `ALTONG_API_KEY`를 필수로 요구하고 `X-API-Key` 인증을 검사합니다. 로컬 무인증 테스트가 꼭 필요할 때만 `ALTONG_ALLOW_UNAUTHENTICATED_LOCAL=true`로 우회합니다. 단일 프로세스 메모리 기반 rate limit도 적용합니다. 로컬 싱글 노드 외부로 노출할 경우 reverse proxy/IP 제한도 함께 적용해야 합니다.
-
-### 9.1 Prompt Injection Policy
-
-현재 차단하는 대표 패턴:
-
-```python
-if "ignore previous instructions" in query:
-    block()
+```text
+.env
+logs/
+artifacts/
+actual data/*.json
+hash manifest
+API keys
+HuggingFace token
+search API keys
 ```
 
-실제 코드는 영어/한국어 prompt injection 의심 표현을 정규식으로 검사합니다. 차단 대상이면 source는 `blocked`, success는 `false`로 로그에 남습니다.
+자세한 기준은 `PORTABLE_INDEX.md`를 따릅니다.
 
-완전 차단은 보장하지 않습니다. 현실적인 다층 방어 기준은 다음 조합입니다.
+## 12. Quick Command Summary
 
-- 입력 단계: 명시적 injection 패턴 차단
-- 검색 단계: RAG context를 신뢰하지 않는 데이터로 취급
-- 프롬프트 단계: context/question delimiter 분리
-- 출력 단계: 운영 전 금칙 응답 validation 추가
-- 재학습 단계: injection 의심 로그는 후보에서 제외
+처음부터 빌드:
 
-## 10. Git / Log / Dependency Policy
+```powershell
+python -m preprocess.pipeline
+python -m preprocess.build_pairs
+python -m preprocess.build_triplet
+python -m intent.train
+python -m rag.embed
+python -m model.train_lora
+```
 
-- Git에 올리지 않을 항목: `.env`, `.env.*`, `.venv/`, `logs/`, `artifacts/`, 실제 운영 데이터가 들어간 `data/*.json`
-- `/ask` 응답에는 운영 로그 노출을 줄이기 위해 사용자 질문 원문을 반환하지 않습니다.
-- `logs/qa.jsonl`에는 재학습 후보 분석을 위해 실패 로그를 남기되, 이메일/전화번호/주민번호/카드번호/API key/token/DB URL 등은 `[REDACTED]`로 마스킹합니다.
-- 민감정보가 감지된 로그는 `sensitive_data_detected=true`로 남기고, `retrain.build_dataset` 후보 생성 단계에서 제외합니다.
-- 로컬 싱글 노드 기준 Redis 기본값은 `redis://localhost:6379/0`입니다. 외부 Redis로 바꾸는 경우 인증/네트워크 제한을 별도로 적용해야 합니다.
-- 재현 가능한 설치가 필요하면 `requirements.lock`을 사용합니다.
+서버 실행:
+
+```powershell
+$env:REDIS_URL = "redis://localhost:6379/0"
+$env:ALTONG_API_KEY = "local-secret-key"
+$env:ALTONG_RATE_LIMIT_PER_MINUTE = "60"
+uvicorn api.server:app --host 127.0.0.1 --port 8000
+```
+
+질문 테스트:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8000/ask" `
+  -Headers @{"X-API-Key"="local-secret-key"} `
+  -ContentType "application/json" `
+  -Body '{"q":"질문내용","language":"ko"}'
+```
+
+재학습 후보 생성:
+
+```powershell
+python -m retrain.build_dataset
+```

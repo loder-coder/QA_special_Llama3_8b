@@ -6,6 +6,7 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 from rag.db import FaissDocumentStore
+from preprocess.io import read_records
 
 
 def _load_documents(data_paths: tuple[str, ...]) -> pd.DataFrame:
@@ -13,7 +14,7 @@ def _load_documents(data_paths: tuple[str, ...]) -> pd.DataFrame:
     for data_path in data_paths:
         path = Path(data_path)
         if path.exists():
-            frame = pd.read_json(path)
+            frame = read_records(path)
             if not frame.empty:
                 frames.append(frame)
     if not frames:
@@ -22,7 +23,7 @@ def _load_documents(data_paths: tuple[str, ...]) -> pd.DataFrame:
 
 
 def build_rag_index(
-    data_paths: tuple[str, ...] = ("data/gold.json", "data/bronze.json"),
+    data_paths: tuple[str, ...] = ("data/Gold.jsonl", "data/Bronze.jsonl"),
     model_name: str = "BAAI/bge-base-en-v1.5",
     index_path: str = "artifacts/rag/faiss.index",
     metadata_path: str = "artifacts/rag/metadata.json",

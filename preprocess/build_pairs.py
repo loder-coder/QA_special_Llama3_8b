@@ -7,16 +7,18 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 
+from preprocess.io import read_records
+
 
 def build_pairs(
-    input_path: str = "data/gold.json",
+    input_path: str = "data/Gold.jsonl",
     output_path: str = "data/pairs.json",
     model_name: str = "BAAI/bge-small-en-v1.5",
     positive_threshold: float = 0.8,
     negative_threshold: float = 0.3,
     batch_size: int = 32,
 ) -> pd.DataFrame:
-    df = pd.read_json(input_path)
+    df = read_records(input_path)
     if df.empty:
         pairs = pd.DataFrame(columns=["q1_id", "q2_id", "q1", "q2", "label", "similarity"])
         pairs.to_json(output_path, orient="records", force_ascii=False, indent=2)

@@ -13,6 +13,7 @@ from model.inference import LlamaAnswerGenerator
 from rag.db import RetrievedDocument
 from rag.retriever import RagRetriever
 from security.output_validator import is_forbidden_output
+from security.language_policy import normalize_language
 from security.prompt_guard import is_prompt_injection
 from security.sensitive_filter import contains_sensitive_data, redact_sensitive_data
 
@@ -24,6 +25,7 @@ class PipelineResult:
     success: bool
     intent_similarity: float
     rag_similarity: float
+    language: str
 
 
 class HybridQAPipeline:
@@ -67,13 +69,14 @@ class HybridQAPipeline:
             "source": result.source,
             "intent_similarity": result.intent_similarity,
             "rag_similarity": result.rag_similarity,
+            "language": result.language,
             "sensitive_data_detected": sensitive_data_detected,
         }
         with self.log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-    def _find_semantic_cache(self, query: str) -> tuple[str | None, float]:
-        cached_items = self.cache.get_cached_items()
+    def _find_semantic_cache(self, query: str, language: str) -> tuple[str | None, float]:
+        cached_items = self.cache.get_cached_items(language=language)
         if not cached_items:
             return None, 0.0
 
@@ -94,43 +97,44 @@ class HybridQAPipeline:
             return cached_items[best_index].answer, best_similarity
         return None, best_similarity
 
-    def ask(self, query: str) -> PipelineResult:
+    def ask(self, query: str, language: str = "ko") -> PipelineResult:
+        normalized_language = normalize_language(language)
         normalized_query = query.strip()
         if not normalized_query:
-            result = PipelineResult("", "validation", False, 0.0, 0.0)
+            result = PipelineResult("", "validation", False, 0.0, 0.0, normalized_language)
             self._write_log(query, result)
             return result
 
         if is_prompt_injection(normalized_query):
-            result = PipelineResult("요청에 안전하지 않은 프롬프트 지시가 포함되어 답변할 수 없습니다.", "blocked", False, 0.0, 0.0)
+            result = PipelineResult("요청에 안전하지 않은 프롬프트 지시가 포함되어 답변할 수 없습니다.", "blocked", False, 0.0, 0.0, normalized_language)
             self._write_log(normalized_query, result)
             return result
 
-        cached = self.cache.get(normalized_query)
+        cached = self.cache.get(normalized_query, language=normalized_language)
         if cached:
-            result = PipelineResult(cached, "redis", True, 0.0, 0.0)
+            result = PipelineResult(cached, "redis", True, 0.0, 0.0, normalized_language)
             self._write_log(normalized_query, result)
             return result
 
-        semantic_cached, semantic_similarity = self._find_semantic_cache(normalized_query)
+        semantic_cached, semantic_similarity = self._find_semantic_cache(normalized_query, language=normalized_language)
         if semantic_cached:
-            self.cache.set(normalized_query, semantic_cached)
-            result = PipelineResult(semantic_cached, "redis_intent", True, semantic_similarity, 0.0)
+            self.cache.set(normalized_query, semantic_cached, language=normalized_language)
+            result = PipelineResult(semantic_cached, "redis_intent", True, semantic_similarity, 0.0, normalized_language)
             self._write_log(normalized_query, result)
             return result
 
         documents = self.retriever.retrieve(normalized_query)
         context, category, rag_similarity = self._context_from_documents(documents, self.rag_threshold)
-        answer = self.generator.generate(normalized_query, context=context, category=category)
+        answer = self.generator.generate(normalized_query, context=context, category=category, language=normalized_language)
         success = bool(answer)
         if success and is_forbidden_output(answer):
-            result = PipelineResult("답변 안전성 검증을 통과하지 못해 응답할 수 없습니다.", "output_blocked", False, semantic_similarity, rag_similarity)
+            result = PipelineResult("답변 안전성 검증을 통과하지 못해 응답할 수 없습니다.", "output_blocked", False, semantic_similarity, rag_similarity, normalized_language)
             self._write_log(normalized_query, result)
             return result
 
         if success:
-            self.cache.set(normalized_query, answer)
+            self.cache.set(normalized_query, answer, language=normalized_language)
 
-        result = PipelineResult(answer, "llm", success, semantic_similarity, rag_similarity)
+        result = PipelineResult(answer, "llm", success, semantic_similarity, rag_similarity, normalized_language)
         self._write_log(normalized_query, result)
         return result

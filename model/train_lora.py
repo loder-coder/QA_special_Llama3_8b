@@ -8,6 +8,8 @@ from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DataCollatorForLanguageModeling, Trainer, TrainingArguments
 
+from preprocess.io import read_records
+
 
 def format_prompt(row: dict) -> str:
     return (
@@ -18,7 +20,7 @@ def format_prompt(row: dict) -> str:
 
 
 def load_prompt_dataset(path: str) -> Dataset:
-    df = pd.read_json(path)
+    df = read_records(path)
     if df.empty:
         raise ValueError(f"dataset is empty: {path}")
     df = df[["category", "question", "answer"]].fillna("")
@@ -68,8 +70,8 @@ def train_one_stage(
 
 def train_lora(
     base_model_name: str = "meta-llama/Llama-3-8b",
-    bronze_path: str = "data/bronze.json",
-    gold_path: str = "data/gold.json",
+    bronze_path: str = "data/Bronze.jsonl",
+    gold_path: str = "data/Gold.jsonl",
     output_dir: str = "artifacts/llama_lora",
     epochs: int = 1,
     batch_size: int = 1,

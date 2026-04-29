@@ -12,6 +12,10 @@ portable/
 local/
 tmp/
 temp/
+*.sha256
+*.sha256.json
+manifest.sha256.json
+PORTABLE_INDEX.md
 
 .cache/
 huggingface/
@@ -20,5 +24,10 @@ transformers_cache/
 data/raw.json
 data/gold.json
 data/bronze.json
+data/Gold.jsonl
+data/Bronze.jsonl
+data/scored.jsonl
+data/report.txt
+data/preprocess_checkpoint.json
 data/retrain_candidates.json
 data/retrain_approved.json
