@@ -4,8 +4,10 @@ import json
 import math
 import os
 import re
+import hashlib
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from json import JSONDecoder
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -22,6 +24,12 @@ from preprocess.clean import clean_text, validate_columns
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 TEXT_SIGNAL = re.compile(r"[0-9A-Za-z가-힣ぁ-んァ-ン一-龥]")
 DEFAULT_CONFIG_PATH = "preprocess/scoring_config.yaml"
+SECURITY_AUDIT_LOG_PATH = Path("logs/security_audit.log")
+PII_PATTERNS = {
+    "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    "phone": re.compile(r"\b(?:01[016789]-?\d{3,4}-?\d{4}|\d{2,3}-\d{3,4}-\d{4})\b"),
+    "resident_registration_number": re.compile(r"\b\d{6}-?[1-4]\d{6}\b"),
+}
 
 
 @dataclass(frozen=True)
@@ -164,7 +172,43 @@ def _has_invalid_training_text(value: object) -> bool:
     return False
 
 
+def _detect_pii(value: object) -> list[str]:
+    text = str(value)
+    return [name for name, pattern in PII_PATTERNS.items() if pattern.search(text)]
+
+
+def _hash_audit_value(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _write_security_audit(row: dict, pii_types: list[str]) -> None:
+    SECURITY_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    audit_payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "event": "pii_dropped_before_scoring",
+        "row_id": str(row.get("id", "")),
+        "pii_types": sorted(set(pii_types)),
+        "content_hash": _hash_audit_value(f"{row.get('question', '')}\n{row.get('answer', '')}"),
+    }
+    with SECURITY_AUDIT_LOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(audit_payload, ensure_ascii=False) + "\n")
+
+
+def _drop_pii_rows(rows: list[dict]) -> list[dict]:
+    kept_rows = []
+    for row in rows:
+        pii_types = _detect_pii(row.get("question", "")) + _detect_pii(row.get("answer", ""))
+        if pii_types:
+            _write_security_audit(row, pii_types)
+            continue
+        kept_rows.append(row)
+    return kept_rows
+
+
 def _clean_chunk(rows: list[dict]) -> list[dict]:
+    if not rows:
+        return []
+    rows = _drop_pii_rows(rows)
     if not rows:
         return []
     df = pd.DataFrame(rows)

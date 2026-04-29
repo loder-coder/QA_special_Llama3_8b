@@ -9,6 +9,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, DataCollatorForLanguageModeling, Trainer, TrainingArguments
 
 from preprocess.io import read_records
+from security.artifact_integrity import write_artifact_manifest
 
 
 def format_prompt(row: dict) -> str:
@@ -108,6 +109,7 @@ def train_lora(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     train_one_stage(model, tokenizer, bronze_path, f"{output_dir}/bronze_stage", epochs, batch_size, learning_rate, max_length)
     train_one_stage(model, tokenizer, gold_path, output_dir, epochs, batch_size, learning_rate, max_length)
+    write_artifact_manifest()
 
 
 if __name__ == "__main__":

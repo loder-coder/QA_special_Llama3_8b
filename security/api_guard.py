@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import os
 import time
+import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 from fastapi import Header, HTTPException, Request
+
+
+logger = logging.getLogger(__name__)
+_unauthenticated_local_warning_logged = False
 
 
 @dataclass
@@ -30,7 +35,18 @@ def configured_api_key() -> str:
 
 
 def allow_unauthenticated_local() -> bool:
-    return os.getenv("ALTONG_ALLOW_UNAUTHENTICATED_LOCAL", "").strip().lower() == "true"
+    requested = os.getenv("ALTONG_ALLOW_UNAUTHENTICATED_LOCAL", "").strip().lower() == "true"
+    if not requested:
+        return False
+    environment = os.getenv("ALTONG_ENV", os.getenv("ENVIRONMENT", "")).strip().lower()
+    if environment in {"prod", "production"}:
+        logger.error("ALTONG_ALLOW_UNAUTHENTICATED_LOCAL was requested but is disabled in production")
+        return False
+    global _unauthenticated_local_warning_logged
+    if not _unauthenticated_local_warning_logged:
+        logger.warning("ALTONG_ALLOW_UNAUTHENTICATED_LOCAL=true is enabled; local requests may bypass API key checks")
+        _unauthenticated_local_warning_logged = True
+    return True
 
 
 def configured_rate_limit() -> int:
@@ -42,6 +58,10 @@ def configured_rate_limit() -> int:
 
 
 rate_limiter = InMemoryRateLimiter(max_requests=configured_rate_limit())
+
+
+def validate_auth_configuration() -> None:
+    allow_unauthenticated_local()
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:

@@ -25,7 +25,8 @@ class RedisCache:
         self.url = url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
         self.prefix = prefix
         self.ttl_seconds = ttl_seconds
-        self.client = redis.Redis.from_url(self.url, decode_responses=True)
+        redis_password = os.getenv("REDIS_PASSWORD", "").strip() or None
+        self.client = redis.Redis.from_url(self.url, password=redis_password, decode_responses=True)
 
     def _key(self, query: str, language: str = "ko") -> str:
         cache_text = f"{language.strip().lower()}:{query.strip().lower()}"
