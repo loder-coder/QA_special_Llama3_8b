@@ -1,39 +1,323 @@
-# Hybrid Q&A System Tutorial Runbook
+# altong_ai 쉬운 운영 안내서
 
-이 문서는 `altong_ai`를 로컬 싱글 노드 AI 서버로 실행하는 순서형 튜토리얼입니다.
+이 문서는 `altong_ai`를 한 대의 AI 서버에서 운영하는 방법을 설명합니다.
 
-목표 구조:
+목표는 단순합니다.
 
 ```text
-Spring Boot Backend
-  -> Internal IP JSON API
-  -> FastAPI /ask
-  -> Redis localhost cache
-  -> RAG / FAISS
-  -> LLM / LoRA model
-  -> JSON answer
+사용자
+  -> Spring Boot 백엔드
+  -> altong_ai FastAPI /ask
+  -> Redis 캐시 확인
+  -> RAG 문서 검색
+  -> LLM 답변 생성
+  -> JSON 답변 반환
 ```
 
-Git에 올리지 않는 데이터, artifact, hash manifest, secret 보관 기준은 `PORTABLE_INDEX.md`를 따릅니다.
+현재 코드는 싱글노드 운영을 기본으로 합니다. 다만 LLM 추론은 필요하면 별도 모델 서버로 분리할 수 있게 되어 있습니다.
 
-## 0. What This Project Does
+```text
+기본값:
+FastAPI가 같은 프로세스에서 로컬 LLaMA/LoRA 모델을 직접 로드
 
-`/ask` API에 JSON으로 질문을 보내면 답변 JSON을 돌려줍니다.
+선택값:
+FastAPI는 질문 처리만 담당하고, LLM 추론은 HTTP 모델 서버에 요청
+```
 
-요청:
+## 1. 전체 구조를 쉽게 이해하기
+
+각 부품의 역할은 아래와 같습니다.
+
+| 이름 | 쉬운 설명 | 담당 |
+| --- | --- | --- |
+| Spring Boot | 실제 서비스 백엔드 | 사용자 요청을 받고 AI 서버 `/ask` 호출 |
+| FastAPI | AI 서버 입구 | 보안 검사, 캐시 확인, RAG 검색, 답변 조립 |
+| Redis | 임시 기억장치 | 같은 질문 또는 비슷한 질문의 답변 재사용 |
+| RAG / FAISS | 문서 검색기 | 답변에 참고할 문서 찾기 |
+| LLM / LoRA | 답변 생성기 | 최종 자연어 답변 생성 |
+| logs | 운영 기록 | 어떤 경로로 답했는지 기록 |
+| artifacts | 모델과 인덱스 결과물 | 학습 모델, FAISS 인덱스, hash manifest 보관 |
+
+운영 중 가장 중요한 원칙은 아래입니다.
+
+- Spring Boot는 Redis나 FAISS를 직접 만지지 않습니다.
+- Spring Boot는 FastAPI `/ask`만 호출합니다.
+- Redis는 외부에 공개하지 않습니다.
+- 모델, 인덱스, 로그, secret은 Git에 올리지 않습니다.
+- 운영 서버에서는 API key 없이 접근할 수 없게 둡니다.
+
+## 2. 처음 한 번 준비하기
+
+### 2.1 Python 준비
+
+프로젝트 폴더에서 실행합니다.
+
+```powershell
+python --version
+```
+
+Python이 없다고 나오면 Python 3.10 이상을 먼저 설치합니다.
+
+가상환경을 만듭니다.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 2.2 Redis 준비
+
+Redis는 캐시용입니다. 운영에서는 비밀번호를 걸어야 합니다.
+
+예시:
+
+```powershell
+docker run --name altong-redis -p 127.0.0.1:6379:6379 redis redis-server --requirepass your_strong_password
+```
+
+서버 실행 전 같은 비밀번호를 환경변수로 넣습니다.
+
+```powershell
+$env:REDIS_PASSWORD = "your_strong_password"
+```
+
+중요:
+
+- Redis 포트는 `127.0.0.1`에만 묶습니다.
+- Redis를 `0.0.0.0`으로 열지 않습니다.
+- Spring Boot에서 Redis로 직접 접속하지 않습니다.
+
+### 2.3 운영 환경변수 준비
+
+운영에서는 아래 값을 지정합니다.
+
+```powershell
+$env:ALTONG_ENV = "production"
+$env:ALTONG_API_KEY = "spring_boot_and_ai_server_shared_secret"
+$env:REDIS_PASSWORD = "your_strong_password"
+```
+
+`ALTONG_ENV`가 `production` 또는 `prod`이면 로컬 무인증 우회가 꺼집니다.
+
+Spring Boot는 `/ask` 요청에 아래 header를 붙여야 합니다.
+
+```text
+X-API-Key: spring_boot_and_ai_server_shared_secret
+```
+
+## 3. LLM 실행 방식을 고르기
+
+### 3.1 기본 방식: FastAPI 안에서 로컬 모델 실행
+
+별도 설정을 하지 않으면 기본값입니다.
+
+```powershell
+$env:ALTONG_GENERATOR_MODE = "local"
+```
+
+이 방식은 구조가 단순합니다. 대신 FastAPI 프로세스가 모델까지 직접 로드하므로 시작 시간이 길고 GPU 메모리를 크게 씁니다.
+
+### 3.2 권장 확장 방식: 모델 서버 분리
+
+운영 안정성을 높이려면 FastAPI와 LLM 추론을 나눕니다.
+
+```text
+FastAPI
+  - API key 확인
+  - prompt injection 차단
+  - Redis cache 확인
+  - RAG 검색
+  - output validation
+  - log 기록
+
+Model Server
+  - 실제 LLM 추론만 담당
+```
+
+FastAPI에서 HTTP 모델 서버를 쓰려면 아래처럼 설정합니다.
+
+```powershell
+$env:ALTONG_GENERATOR_MODE = "http"
+$env:ALTONG_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
+$env:ALTONG_MODEL_SERVER_TIMEOUT_SECONDS = "60"
+```
+
+모델 서버는 JSON 응답에 아래 중 하나를 넣으면 됩니다.
 
 ```json
 {
-  "q": "질문내용",
-  "language": "ko"
+  "answer": "답변 내용"
 }
 ```
 
-응답:
+또는:
 
 ```json
 {
-  "answer": "답변내용",
+  "text": "답변 내용"
+}
+```
+
+OpenAI 호환 형태의 `choices[0].message.content`도 읽을 수 있습니다.
+
+처음에는 `local`로 검증하고, 운영 안정화 단계에서 `http`로 분리하는 순서를 권장합니다.
+
+## 4. 데이터 준비 순서
+
+AI 서버는 원본 데이터가 바로 답변에 쓰이지 않습니다. 아래 순서로 정제하고 결과물을 만듭니다.
+
+### 4.1 원본 데이터 넣기
+
+원본 데이터는 보통 아래 필드를 가집니다.
+
+```json
+{
+  "id": 1,
+  "question": "질문",
+  "answer": "답변",
+  "category": "카테고리",
+  "views": 0,
+  "donation": 0
+}
+```
+
+### 4.2 데이터 정제
+
+```powershell
+python -m preprocess.pipeline
+```
+
+이 단계에서 하는 일:
+
+- 너무 짧거나 이상한 질문 제거
+- 개인정보가 들어간 데이터 제외
+- 중복 질문 정리
+- 학습용 데이터와 RAG용 데이터 분리
+
+### 4.3 intent pair 생성
+
+```powershell
+python -m preprocess.build_pairs
+```
+
+이 단계는 비슷한 질문끼리 묶는 재료를 만듭니다.
+
+### 4.4 triplet 생성
+
+```powershell
+python -m preprocess.build_triplet
+```
+
+이 단계는 intent 모델 학습에 쓸 `anchor`, `positive`, `negative` 구조를 만듭니다.
+
+### 4.5 intent 모델 학습
+
+```powershell
+python -m intent.train
+```
+
+triplet 데이터가 있으면 `TripletLoss`로 학습합니다.
+
+triplet이 부족하면 q-q pair 기반 `CosineSimilarityLoss`로 fallback합니다.
+
+pair도 없으면 base intent model을 저장해서 전체 흐름이 멈추지 않게 합니다.
+
+### 4.6 RAG 인덱스 생성
+
+```powershell
+python -m rag.embed
+```
+
+이 단계는 검색용 FAISS index와 metadata를 만듭니다.
+
+### 4.7 LoRA 학습
+
+```powershell
+python -m model.train_lora
+```
+
+이 단계는 LLM adapter를 학습합니다.
+
+학습이 끝나면 `artifacts/manifest.hash`도 생성되어야 합니다.
+
+## 5. 서버 실행 순서
+
+### 5.1 Redis 먼저 실행
+
+Redis가 먼저 떠 있어야 합니다.
+
+```powershell
+docker start altong-redis
+```
+
+### 5.2 환경변수 설정
+
+운영 예시:
+
+```powershell
+$env:ALTONG_ENV = "production"
+$env:ALTONG_API_KEY = "spring_boot_and_ai_server_shared_secret"
+$env:REDIS_PASSWORD = "your_strong_password"
+$env:ALTONG_GENERATOR_MODE = "local"
+```
+
+HTTP 모델 서버를 쓸 때:
+
+```powershell
+$env:ALTONG_GENERATOR_MODE = "http"
+$env:ALTONG_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
+```
+
+### 5.3 모델 서버 실행
+
+`ALTONG_GENERATOR_MODE=local`이면 이 단계는 필요 없습니다.
+
+`ALTONG_GENERATOR_MODE=http`이면 FastAPI를 켜기 전에 모델 서버를 먼저 켭니다.
+
+모델 서버는 아래 정보를 받아 답변을 생성해야 합니다.
+
+```json
+{
+  "prompt": "최종 프롬프트",
+  "question": "질문",
+  "context": "RAG 참고 문서",
+  "category": "카테고리",
+  "language": "ko",
+  "max_new_tokens": 512,
+  "temperature": 0.2,
+  "top_p": 0.9
+}
+```
+
+### 5.4 FastAPI 실행
+
+```powershell
+uvicorn api.server:app --host 0.0.0.0 --port 8000
+```
+
+처음에는 내부망에서만 접근 가능하게 방화벽을 제한합니다.
+
+Spring Boot 서버 IP만 `8000` 포트에 접근할 수 있게 두는 것이 좋습니다.
+
+## 6. 정상 동작 확인
+
+로컬 테스트:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://localhost:8000/ask" `
+  -Headers @{ "X-API-Key" = $env:ALTONG_API_KEY } `
+  -ContentType "application/json" `
+  -Body '{"q":"테스트 질문입니다","language":"ko"}'
+```
+
+정상 응답 예시:
+
+```json
+{
+  "answer": "답변 내용",
   "success": true,
   "source": "llm",
   "intent_similarity": 0.0,
@@ -42,466 +326,192 @@ Git에 올리지 않는 데이터, artifact, hash manifest, secret 보관 기준
 }
 ```
 
-지원 언어:
+`source` 의미:
+
+| source | 의미 |
+| --- | --- |
+| `redis` | 완전히 같은 질문이 캐시에서 재사용됨 |
+| `redis_intent` | 비슷한 질문의 답변이 캐시에서 재사용됨 |
+| `llm` | RAG 검색 후 LLM이 새 답변을 생성함 |
+| `blocked` | prompt injection 의심 요청 차단 |
+| `output_blocked` | 답변 보안 검사에서 차단 |
+| `validation` | 빈 질문 등 기본 검증 실패 |
+
+## 7. `/ask` 내부 처리 순서
+
+요청 하나는 아래 순서로 처리됩니다.
 
 ```text
-ko, en, ja, zh, vi
-```
-
-## 1. First-Time Setup
-
-### 1.1 Required Tools
-
-필요한 것:
-
-- Python 3.10 이상
-- Redis
-- HuggingFace 계정과 token
-- `meta-llama/Llama-3-8b` 접근 권한
-- 충분한 디스크 공간
-- LoRA/QLoRA 학습을 하려면 CUDA GPU 권장
-
-확인:
-
-```powershell
-python --version
-```
-
-실패하면 Python 설치 또는 PATH 설정이 먼저 필요합니다.
-
-### 1.2 Python Environment
-
-프로젝트 폴더에서 실행합니다.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-재현 가능한 설치가 필요하면:
-
-```powershell
-pip install -r requirements.lock
-```
-
-### 1.3 HuggingFace Login
-
-LLaMA 모델 다운로드 권한이 필요합니다.
-
-```powershell
-huggingface-cli login
-```
-
-토큰은 Git에 올리지 않습니다.
-
-### 1.4 Redis Start
-
-Docker가 있으면:
-
-```powershell
-docker run --name qa-redis -p 127.0.0.1:6379:6379 -d redis:7 redis-server --requirepass your_strong_password
-```
-
-이미 만든 컨테이너가 있으면:
-
-```powershell
-docker start qa-redis
-```
-
-Redis는 AI 서버 내부에서만 쓰는 전제입니다.
-
-## 2. Environment Variables
-
-서버 실행 전에 PowerShell에 설정합니다.
-
-```powershell
-$env:REDIS_URL = "redis://localhost:6379/0"
-$env:REDIS_PASSWORD = "your_strong_password"
-$env:ALTONG_API_KEY = "local-secret-key"
-$env:ALTONG_RATE_LIMIT_PER_MINUTE = "60"
-```
-
-임시 로컬 테스트에서 API key 검사를 끄고 싶을 때만 사용합니다.
-
-```powershell
-$env:ALTONG_ALLOW_UNAUTHENTICATED_LOCAL = "true"
-```
-
-운영에서는 `ALTONG_ALLOW_UNAUTHENTICATED_LOCAL`을 사용하지 않습니다.
-
-프로덕션 환경에서는 아래처럼 지정합니다. 이 값이 `production` 또는 `prod`이면 `ALTONG_ALLOW_UNAUTHENTICATED_LOCAL=true`를 설정해도 API key 우회가 강제로 비활성화됩니다.
-
-```powershell
-$env:ALTONG_ENV = "production"
-```
-
-## 3. Prepare Data
-
-### 3.1 Raw Data Shape
-
-`data/raw.json`은 배열이어야 합니다.
-
-실제 운영 데이터는 Git에 올리지 않고 `PORTABLE_INDEX.md` 기준으로 보관합니다.
-
-```json
-[
-  {
-    "id": "q_0001",
-    "question": "사용자 질문 원문",
-    "answer": "기준 답변 본문",
-    "category": "질문 카테고리",
-    "views": 100,
-    "donation": 50
-  }
-]
-```
-
-필드 의미:
-
-- `id`: 질문 고유 ID
-- `question`: 유사 질문 탐지와 intent 학습에 사용할 질문
-- `answer`: RAG와 LLM 학습에 사용할 답변
-- `category`: 답변 생성 prompt의 분류값
-- `views`: 점수 계산용 조회수
-- `donation`: 점수 계산용 가치 점수
-
-### 3.2 Clean Raw Data
-
-```powershell
-python -m preprocess.pipeline
-```
-
-결과:
-
-```text
-data/Gold.jsonl
-data/Bronze.jsonl
-data/report.txt
-data/preprocess_checkpoint.json
-```
-
-정제 과정:
-
-- HTML tag 제거
-- 중복 공백 제거
-- `null`, 빈 문자열, 제어 문자, 특수문자만 있는 질문/답변 제거
-- 이메일, 전화번호, 주민번호 같은 개인정보 패턴이 있으면 Q_score 계산 전에 즉시 제거
-- 20자 미만 또는 1000자 초과 답변은 제거하지 않고 `Length_Penalty`로 감점
-- `views`, `donation` 숫자화
-- `Sim(Q, A)`, `1/PPL`, `Length_Penalty` 기반 Q_score 계산
-- 상위 데이터는 `gold`, 나머지는 `bronze`로 분리
-
-Q_score preprocessing additions:
-
-- null, empty string, control-character, special-character-only row drop
-- streaming chunk processing for large JSON / JSONL input
-- CPU multiprocessing for cleaning chunks
-- Q_score = alpha * Sim(Q, A) + beta * (1/PPL) + gamma * Length_Penalty
-- top 10 percent -> `Gold.jsonl`, remainder -> `Bronze.jsonl`
-- checkpoint resume through `data/preprocess_checkpoint.json`
-- PII detection audit through `logs/security_audit.log`
-
-Q_score weights are not fixed in code. Set them in `preprocess/scoring_config.yaml` or override them with environment variables:
-
-```powershell
-$env:ALTONG_SCORING_ALPHA = "0.55"
-$env:ALTONG_SCORING_BETA = "0.35"
-$env:ALTONG_SCORING_GAMMA = "0.10"
-$env:ALTONG_SCORING_LLAMA_MODEL_PATH = "C:\models\Llama-3-8B"
-```
-
-### 3.3 What Changed In Plain Language
-
-이번 전처리 변경은 "좋은 학습 데이터와 참고용 데이터를 자동으로 나누는 작업"입니다.
-
-예전 방식은 조회수(`views`)와 후원값(`donation`)처럼 숫자로 된 인기도를 보고 데이터를 나눴습니다. 새 방식은 질문과 답변의 실제 품질을 더 많이 봅니다. 즉, 사람들이 많이 본 글인지보다 "질문과 답변이 서로 잘 맞는지", "답변 문장이 자연스러운지", "답변 길이가 너무 짧거나 너무 길지 않은지"를 점수로 계산합니다.
-
-새 점수는 `Q_score`라고 부릅니다.
-
-```text
-Q_score = 질문-답변 유사도 + 답변 자연스러움 + 답변 길이 점수
-```
-
-각 항목의 의미는 다음과 같습니다.
-
-- `Sim(Q, A)`: 질문과 답변이 얼마나 잘 맞는지 보는 점수입니다. 예를 들어 "비밀번호를 잊었어요"라는 질문에 "비밀번호 재설정 방법"을 답하면 높고, 전혀 다른 답변이면 낮습니다.
-- `1/PPL`: 답변 문장이 얼마나 자연스러운지 보는 점수입니다. Llama 3 모델이 읽었을 때 어색하고 이상한 문장일수록 점수가 낮아집니다.
-- `Length_Penalty`: 답변 길이에 대한 감점입니다. 20자 미만이면 너무 짧다고 보고 감점하고, 1000자를 넘으면 너무 길다고 보고 감점합니다.
-
-최종 결과 파일은 이렇게 나뉩니다.
-
-- `data/Gold.jsonl`: 점수가 높은 상위 10% 데이터입니다. LoRA 학습에 우선 사용합니다.
-- `data/Bronze.jsonl`: 나머지 데이터입니다. RAG 검색 인덱스에 넣어 참고 문서처럼 사용합니다.
-- `data/report.txt`: Gold와 Bronze가 각각 몇 개이고, 평균 점수와 최소/최대 점수가 얼마인지 보여주는 요약 보고서입니다.
-- `data/preprocess_checkpoint.json`: 중간 저장 파일입니다. 1.5GB처럼 큰 파일을 처리하다가 중간에 멈춰도 처음부터 다시 하지 않도록 도와줍니다.
-- `data/scored.jsonl`: 점수 계산이 끝난 전체 중간 결과입니다. 최종 분리 전 임시 결과로 보면 됩니다.
-
-대용량 데이터를 안전하게 처리하기 위해 한 번에 전체 파일을 메모리에 올리지 않습니다. 큰 박스를 한꺼번에 들지 않고 작은 묶음으로 나눠 옮기는 것처럼, JSON 데이터를 chunk 단위로 조금씩 읽고 처리합니다.
-
-정제 중 아래 데이터는 학습 오류를 만들 수 있으므로 점수 계산 전에 제외합니다.
-
-- 질문이나 답변이 비어 있는 데이터
-- `null` 값이 들어 있는 데이터
-- 제어 문자처럼 학습에 방해되는 문자가 들어 있는 데이터
-- 특수문자만 있고 실제 글자나 숫자가 없는 데이터
-- 이메일, 전화번호, 주민번호가 포함된 데이터
-
-개인정보가 탐지되어 제거된 경우 `logs/security_audit.log`에 감사 기록을 남깁니다. 이 로그에는 원문 개인정보를 남기지 않고, row id, 탐지 종류, 콘텐츠 해시만 남깁니다.
-
-`alpha`, `beta`, `gamma`는 점수 계산에서 어떤 항목을 더 중요하게 볼지 정하는 비율입니다. 코드에 고정하지 않고 `preprocess/scoring_config.yaml` 또는 환경 변수로 바꿀 수 있습니다.
-
-- `alpha`를 키우면 질문과 답변이 서로 맞는지를 더 중요하게 봅니다.
-- `beta`를 키우면 답변 문장의 자연스러움을 더 중요하게 봅니다.
-- `gamma`를 키우면 답변 길이가 적절한지를 더 중요하게 봅니다.
-
-조금 더 실무적으로 보면 아래처럼 바뀝니다.
-
-```text
-Q_score = alpha * Sim(Q, A) + beta * (1/PPL) + gamma * Length_Penalty
-```
-
-- `alpha`가 커지면 Gold에 들어갈 데이터가 "질문과 답변이 정확히 짝이 맞는지" 중심으로 뽑힙니다. FAQ처럼 질문-답변 매칭이 중요한 데이터에 유리합니다.
-- `alpha`가 너무 크면 문장은 자연스럽지만 질문과 약간 다르게 표현된 좋은 답변이 낮게 평가될 수 있습니다.
-- `beta`가 커지면 Gold에 들어갈 데이터가 "문장이 자연스럽고 모델이 읽기 쉬운지" 중심으로 뽑힙니다. LoRA 학습용 답변 품질을 올리는 데 유리합니다.
-- `beta`가 너무 크면 질문과 완전히 맞지는 않아도 문장만 자연스러운 답변이 높게 평가될 수 있습니다.
-- `gamma`가 커지면 Gold에 들어갈 데이터가 "답변 길이가 너무 짧거나 너무 길지 않은지" 중심으로 뽑힙니다. 짧은 단답이나 지나치게 긴 복붙 답변을 줄이는 데 유리합니다.
-- `gamma`가 너무 크면 짧지만 정확한 답변이나 길지만 필요한 설명이 많은 답변이 낮게 평가될 수 있습니다.
-
-처음에는 현재 기본값처럼 `alpha=0.55`, `beta=0.35`, `gamma=0.10`으로 두는 것이 무난합니다. 질문-답변이 엉뚱하게 연결된 데이터가 많으면 `alpha`를 올리고, 문장이 어색한 데이터가 많으면 `beta`를 올리고, 너무 짧거나 긴 답변이 Gold에 많이 섞이면 `gamma`를 올립니다.
-
-### 3.4 Compatibility With The Previous Preprocess
-
-기존 전처리와 새 전처리는 동시에 같은 기준을 중복 적용하지 않습니다. 새 전처리에서는 기존 단계 중 일부를 그대로 유지하고, 일부는 Q_score 방식으로 대체했습니다.
-
-유지된 부분:
-
-- 필수 컬럼 확인: `id`, `question`, `answer`, `category`, `views`, `donation`이 없으면 오류 처리
-- HTML tag 제거
-- 중복 공백 제거
-- `views`, `donation` 숫자 변환
-- 질문/답변이 비어 있거나 학습에 위험한 값이면 제거
-
-대체된 부분:
-
-- 기존 `score = views * 0.3 + donation * 0.7` 방식은 더 이상 최종 분류 점수로 쓰지 않습니다.
-- 기존에는 20자 미만 답변을 제거했지만, 새 방식에서는 제거하지 않고 `Length_Penalty`로 감점합니다.
-- 기존 main preprocess의 SBERT 중복 제거 단계는 새 main preprocess에서 직접 실행하지 않습니다. 현재 Gold/Bronze 분류는 Q_score 기준 상위 10% 분류가 우선입니다.
-
-따라서 현재 기준에서 확인된 핵심 충돌은 없습니다. 다만 운영 정책상 "20자 미만 답변은 무조건 삭제"가 필요해지면 `Length_Penalty` 방식과 목표가 달라지므로 둘 중 하나를 선택해야 합니다. 지금 요구사항은 "길이 조건은 감점"이므로 새 전처리 기준과 맞습니다.
-
-## 4. Build Training And Search Artifacts
-
-아래 순서대로 실행합니다.
-
-```powershell
-python -m preprocess.build_pairs
-python -m preprocess.build_triplet
-python -m intent.train
-python -m rag.embed
-python -m model.train_lora
-```
-
-각 단계 의미:
-
-- `preprocess.build_pairs`: intent 학습용 질문 pair 생성
-- `preprocess.build_triplet`: intent 학습용 triplet 생성
-- `intent.train`: 유사 질문 판단 모델 생성
-- `rag.embed`: FAISS index와 metadata 생성
-- `model.train_lora`: LLaMA LoRA adapter 학습
-- `model.train_lora`: 학습 완료 후 `artifacts/manifest.hash` SHA-256 manifest 생성
-
-주요 결과:
-
-```text
-data/pairs.json
-data/triplets.json
-artifacts/intent_model
-artifacts/rag/faiss.index
-artifacts/rag/metadata.json
-artifacts/llama_lora
-artifacts/manifest.hash
-```
-
-생성된 `data/`, `artifacts/`, logs, hash manifest 보관 기준은 `PORTABLE_INDEX.md`를 따릅니다.
-
-API 서버는 시작할 때 `artifacts/manifest.hash`와 현재 `artifacts/` 폴더의 SHA-256 해시를 비교합니다. 파일이 바뀌었거나 빠졌거나 새 파일이 추가되면 서버 시작을 중단합니다.
-
-## 5. Start API Server
-
-모든 artifact가 준비된 뒤 서버를 실행합니다.
-
-로컬 테스트:
-
-```powershell
-uvicorn api.server:app --host 127.0.0.1 --port 8000
-```
-
-Spring Boot가 사내 내부망에서 호출해야 하면 AI 서버 내부 IP로 열 수 있습니다.
-
-```powershell
-uvicorn api.server:app --host 0.0.0.0 --port 8000
-```
-
-이 경우 Windows 방화벽 또는 사내 방화벽에서 Spring Boot 서버 IP만 `8000` 포트 접근을 허용해야 합니다.
-
-## 6. Use The Model
-
-### 6.1 PowerShell Test
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:8000/ask" `
-  -Headers @{"X-API-Key"="local-secret-key"} `
-  -ContentType "application/json" `
-  -Body '{"q":"질문내용","language":"ko"}'
-```
-
-영어 답변 요청:
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:8000/ask" `
-  -Headers @{"X-API-Key"="local-secret-key"} `
-  -ContentType "application/json" `
-  -Body '{"q":"How do I use this service?","language":"en"}'
-```
-
-베트남어 답변 요청:
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:8000/ask" `
-  -Headers @{"X-API-Key"="local-secret-key"} `
-  -ContentType "application/json" `
-  -Body '{"q":"Cach su dung dich vu nay?","language":"vi"}'
-```
-
-### 6.2 Spring Boot Call Shape
-
-Spring Boot에서는 AI 서버 내부 IP로 JSON POST를 보냅니다.
-
-```text
-POST http://10.x.x.x:8000/ask
-Header: X-API-Key: <ALTONG_API_KEY>
-Content-Type: application/json
-```
-
-Body:
-
-```json
-{
-  "q": "질문내용",
-  "language": "ko"
-}
-```
-
-외부 공개 DNS보다 사내 내부 IP 또는 내부 DNS를 우선합니다.
-
-## 7. Runtime Flow
-
-`/ask` 요청은 아래 순서로 처리됩니다.
-
-```text
-1. API key 검사
-2. rate limit 검사
-3. q 길이 검증
-4. language 정규화
-5. prompt injection 의심 패턴 차단
+1. API key 확인
+2. rate limit 확인
+3. 언어값 정리
+4. 빈 질문 차단
+5. prompt injection 차단
 6. Redis exact cache 확인
 7. Redis semantic cache 확인
-8. RAG 검색
+8. RAG 문서 검색
 9. LLM 답변 생성
 10. output validation
 11. Redis cache 저장
 12. logs/qa.jsonl 기록
 ```
 
-캐시 우선순위:
+캐시 우선순위는 유지해야 합니다.
 
 ```text
-exact cache -> semantic cache -> RAG + LLM
+exact match
+  -> intent similarity 0.9 이상 cache reuse
+  -> RAG + LLM
 ```
 
-언어별 캐시는 분리됩니다. 같은 질문이라도 `ko`와 `en`은 다른 캐시로 저장됩니다.
+이 순서를 바꾸면 답변 품질과 비용 구조가 달라집니다.
 
-## 8. Debug Tutorial
+## 8. 운영 방법
 
-### 8.1 Python Command Not Found
+### 8.1 매일 확인할 것
+
+- FastAPI 서버가 떠 있는지 확인
+- Redis가 떠 있는지 확인
+- `/ask` 테스트 요청이 성공하는지 확인
+- `logs/qa.jsonl`이 계속 쌓이는지 확인
+- `source="llm"` 비율이 갑자기 늘지 않았는지 확인
+- `output_blocked`가 갑자기 늘지 않았는지 확인
+
+### 8.2 로그 확인
+
+운영 로그:
+
+```text
+logs/qa.jsonl
+```
+
+보안 감사 로그:
+
+```text
+logs/security_audit.log
+```
+
+로그에는 질문 원문 대신 hash와 길이 중심으로 남깁니다.
+
+민감정보가 포함된 질문이나 답변은 학습 후보로 바로 쓰지 않습니다.
+
+### 8.3 캐시 운영
+
+Redis cache는 영구 데이터가 아닙니다.
+
+아래 상황에서는 캐시를 비우거나 namespace를 바꾸는 것이 좋습니다.
+
+- embedding 모델 변경
+- intent 모델 변경
+- RAG 데이터 대량 변경
+- LoRA 모델 변경
+- 잘못된 답변이 캐시에 들어간 경우
+
+### 8.4 배포 운영
+
+권장 배포 순서:
+
+```text
+1. 새 데이터 정제
+2. intent / RAG / LoRA artifact 생성
+3. 테스트 서버에서 /ask 확인
+4. artifact manifest 확인
+5. 운영 서버 중지
+6. artifact 교체
+7. Redis cache 정리 여부 판단
+8. 운영 서버 시작
+9. Spring Boot에서 테스트 호출
+10. 로그 확인
+```
+
+운영 중 artifact만 몰래 바꾸지 않습니다.
+
+`artifacts/manifest.hash`와 실제 artifact가 맞지 않으면 서버 시작이 중단될 수 있습니다.
+
+## 9. 추후 관리 방법
+
+### 9.1 데이터 관리
+
+새 질문/답변 데이터는 바로 gold 데이터로 승격하지 않습니다.
+
+권장 흐름:
+
+```text
+1. logs에서 학습 후보 수집
+2. 개인정보와 prompt injection 의심 데이터 제거
+3. 사람이 답변 품질 확인
+4. 승인된 데이터만 gold로 승격
+5. 정제와 학습 파이프라인 다시 실행
+```
+
+자동화해도 마지막 gold 승격은 사람이 확인하는 것이 안전합니다.
+
+### 9.2 모델 관리
+
+모델을 바꾸면 아래 항목을 같이 확인합니다.
+
+- intent model
+- RAG embedding model
+- FAISS index
+- semantic cache
+- LoRA adapter
+- `artifacts/manifest.hash`
+
+embedding 모델을 바꾸면 기존 FAISS index와 semantic cache는 같은 기준으로 다시 만들어야 합니다.
+
+### 9.3 보안 관리
+
+정기적으로 확인할 것:
+
+- `ALTONG_API_KEY`가 Git에 들어가지 않았는지 확인
+- `REDIS_PASSWORD`가 Git에 들어가지 않았는지 확인
+- Redis가 외부에 열려 있지 않은지 확인
+- FastAPI `8000` 포트가 Spring Boot 서버에서만 접근 가능한지 확인
+- `ALTONG_ENV=production`이 운영 서버에 설정되어 있는지 확인
+
+### 9.4 성능 관리
+
+처음에는 아래 숫자를 봅니다.
+
+- 평균 응답 시간
+- 가장 느린 응답 시간
+- cache hit 비율
+- LLM 호출 비율
+- GPU 메모리 사용량
+- Redis 메모리 사용량
+
+문제가 생기는 방향:
+
+- cache hit이 낮으면 LLM 호출이 늘어납니다.
+- LLM 호출이 늘면 GPU 사용량과 응답 시간이 늘어납니다.
+- semantic cache가 너무 공격적이면 틀린 답변을 재사용할 수 있습니다.
+
+현재 기준에서는 semantic cache threshold `0.9`를 보수적으로 유지합니다.
+
+## 10. 장애 대응
+
+### 10.1 Redis 연결 실패
 
 증상:
 
 ```text
-Python was not found
-```
-
-확인:
-
-```powershell
-python --version
-```
-
-해결:
-
-- Python 설치
-- PATH 설정
-- Windows App Execution Alias 비활성화 확인
-
-### 8.2 Redis Connection Error
-
-증상:
-
-```text
-Connection refused
 Error connecting to Redis
-invalid username-password pair
 ```
 
 확인:
 
 ```powershell
 docker ps
+$env:REDIS_PASSWORD
 ```
 
 해결:
 
-```powershell
-docker start qa-redis
-$env:REDIS_URL = "redis://localhost:6379/0"
-$env:REDIS_PASSWORD = "your_strong_password"
-```
+- Redis 컨테이너가 떠 있는지 확인
+- `REDIS_PASSWORD`가 Redis 실행 비밀번호와 같은지 확인
+- Redis 포트가 `127.0.0.1:6379`로 열려 있는지 확인
 
-### 8.3 API Key Error
-
-증상:
-
-```text
-401 invalid api key
-503 api key is not configured
-```
-
-확인:
-
-```powershell
-$env:ALTONG_API_KEY
-```
-
-해결:
-
-```powershell
-$env:ALTONG_API_KEY = "local-secret-key"
-```
-
-요청 header에도 같은 값을 넣습니다.
-
-```text
-X-API-Key: local-secret-key
-```
-
-### 8.4 FAISS Index Missing
+### 10.2 RAG 파일 없음
 
 증상:
 
@@ -515,41 +525,47 @@ RAG index files are missing. Run rag/embed.py first.
 python -m rag.embed
 ```
 
-그래도 실패하면 `data/Gold.jsonl`, `data/Bronze.jsonl`이 있는지 확인합니다.
+생성되어야 하는 파일:
 
-### 8.5 LoRA Adapter Missing
+```text
+artifacts/rag/faiss.index
+artifacts/rag/metadata.json
+```
+
+### 10.3 manifest 불일치
 
 증상:
 
 ```text
-artifacts/llama_lora not found
+artifact manifest verification failed
 ```
 
 해결:
 
-```powershell
-python -m model.train_lora
-```
+- artifact 파일을 교체했는지 확인
+- 학습 또는 인덱스 생성을 다시 실행
+- `artifacts/manifest.hash`가 최신 artifact 기준인지 확인
 
-모델 접근 권한 또는 GPU/메모리 문제가 있을 수 있습니다.
+### 10.4 모델 서버 응답 실패
 
-### 8.6 HuggingFace Model Download Error
+`ALTONG_GENERATOR_MODE=http`일 때만 해당합니다.
 
 확인:
 
 ```powershell
-huggingface-cli login
+$env:ALTONG_MODEL_SERVER_URL
 ```
 
-점검:
+해결:
 
-- HuggingFace token이 맞는지
-- `meta-llama/Llama-3-8b` 접근 권한이 있는지
-- 인터넷 연결이 되는지
+- 모델 서버가 먼저 떠 있는지 확인
+- `/generate` endpoint가 POST JSON을 받는지 확인
+- 응답에 `answer`, `text`, `generated_text`, 또는 `choices[0].message.content`가 있는지 확인
+- timeout이 너무 짧으면 `ALTONG_MODEL_SERVER_TIMEOUT_SECONDS`를 늘림
 
-### 8.7 Output Blocked
+### 10.5 답변이 보안 검사에서 차단됨
 
-응답 source가 아래처럼 나오면:
+증상:
 
 ```json
 {
@@ -558,206 +574,81 @@ huggingface-cli login
 }
 ```
 
-의미:
-
-- LLM 답변에 내부 prompt 표식 또는 금칙 문구가 섞였습니다.
-- 답변을 사용자에게 보내지 않고 차단한 상태입니다.
-
 확인:
 
-```text
-logs/qa.jsonl
-```
+- LLM 답변에 내부 prompt 표식이 섞였는지 확인
+- 금칙 문구가 답변에 들어갔는지 확인
+- RAG 문서 안에 prompt injection 문장이 들어갔는지 확인
 
-민감정보는 `[REDACTED]`로 마스킹됩니다.
+## 11. 운영 체크리스트
 
-## 9. Retraining Tutorial
+처음 설치:
 
-운영 중 실패 로그를 모아 재학습 후보를 만들 수 있습니다.
+- [ ] Python 가상환경 생성
+- [ ] `pip install -r requirements.txt`
+- [ ] Redis 비밀번호 설정
+- [ ] `ALTONG_API_KEY` 설정
+- [ ] `ALTONG_ENV=production` 설정
+- [ ] 데이터 정제 실행
+- [ ] intent 학습 실행
+- [ ] RAG index 생성
+- [ ] LoRA 학습 또는 모델 서버 준비
+- [ ] `/ask` 테스트 성공
 
-### 9.1 Build Review Candidates
+배포 전:
 
-```powershell
-python -m retrain.build_dataset
-```
+- [ ] artifact manifest 최신 여부 확인
+- [ ] Redis cache 유지 또는 삭제 여부 결정
+- [ ] Spring Boot가 `X-API-Key`를 보내는지 확인
+- [ ] FastAPI 포트 접근 제한 확인
+- [ ] 테스트 질문 3개 이상 확인
 
-결과:
+매주:
 
-```text
-data/retrain_candidates.json
-```
+- [ ] cache hit 비율 확인
+- [ ] 느린 요청 확인
+- [ ] `output_blocked` 증가 여부 확인
+- [ ] 학습 후보 로그 검토
+- [ ] disk 용량 확인
 
-자동 제외:
+모델 또는 데이터 변경 후:
 
-- prompt injection 의심 query
-- 민감정보 포함 query/answer
-- 너무 짧은 query
-- `sensitive_data_detected=true` 로그
+- [ ] FAISS index 재생성 필요 여부 확인
+- [ ] semantic cache 초기화 필요 여부 확인
+- [ ] manifest 재생성 확인
+- [ ] 운영 반영 전 테스트 서버에서 확인
 
-### 9.2 Manual Approval
+## 12. 수정된 코드 구조
 
-사람이 후보를 검토하고 승인 파일을 만듭니다.
-
-```text
-data/retrain_approved.json
-```
-
-승인된 item에는 사람이 확정한 답변과 `approved=true`가 있어야 합니다.
-
-### 9.3 Add Approved Data To Gold
-
-Python 환경에서 실행합니다.
-
-```python
-from retrain.build_dataset import add_approved_queries_to_gold
-
-add_approved_queries_to_gold()
-```
-
-주의:
-
-- 실패 로그를 자동으로 `gold`에 넣지 않습니다.
-- 최종 승인은 반드시 사람이 합니다.
-- 웹 검색 결과를 학습 데이터로 넣을 때는 출처와 검증 여부를 따로 확인합니다.
-
-## 10. Security Notes
-
-현재 적용된 방어:
-
-- POST JSON body 사용
-- `q` 길이 제한
-- API key 검사
-- 단일 프로세스 rate limit
-- prompt injection 입력 차단
-- system prompt와 사용자 데이터 영역 분리
-- output validation
-- `logs/qa.jsonl` whitelist logging: 원문 질문/답변을 저장하지 않고 hash, 길이, 성공 여부, source, similarity, language만 저장
-- PII scanner: 전처리 단계에서 이메일, 전화번호, 주민번호 포함 row를 Q_score 계산 전에 제거
-- PII audit: 제거 이벤트를 `logs/security_audit.log`에 원문 없이 기록
-- Redis password auth: `REDIS_PASSWORD`로 Redis 인증
-- artifact integrity check: `artifacts/manifest.hash` 기준으로 API 시작 시 SHA-256 검증
-- 언어별 Redis cache 분리
-
-아직 주의할 점:
-
-- prompt injection 방어는 완전 차단이 아닙니다.
-- Redis는 `127.0.0.1` 바인딩과 비밀번호 사용 전제입니다.
-- `artifacts/manifest.hash` 자체는 무결성 기준 파일이므로 Git이나 외부 응답에 노출하지 않습니다.
-- rate limit은 메모리 기반이라 다중 worker에서는 공유되지 않습니다.
-- 웹 검색 확장은 아직 별도 구현이 필요합니다.
-
-외부 공개보다 사내 내부 IP 연결을 우선합니다.
-
-### 10.1 Latest Security Change Summary
-
-이번 보안 업데이트는 로컬 LLM 파이프라인에서 개인정보 유출, 무인증 접근, artifact 변조, 시스템 프롬프트 노출을 줄이기 위한 변경입니다.
-
-변경된 실행 영향:
-
-- Redis는 이제 비밀번호가 필요합니다. `docker run`에서 `redis-server --requirepass your_strong_password`를 사용하고, 서버 실행 전 `$env:REDIS_PASSWORD`를 같은 값으로 설정해야 합니다.
-- 운영 환경은 `$env:ALTONG_ENV = "production"` 또는 `"prod"`로 표시합니다. 이 상태에서는 `ALTONG_ALLOW_UNAUTHENTICATED_LOCAL=true`를 설정해도 API key 우회가 동작하지 않습니다.
-- `model.train_lora`가 끝나면 `artifacts/manifest.hash`가 생성됩니다. 이 파일은 현재 `artifacts/` 폴더의 SHA-256 목록입니다.
-- API 서버는 시작 시 `artifacts/manifest.hash`를 읽고 현재 artifact 파일들과 비교합니다. 파일이 누락, 추가, 변조되면 서버가 시작되지 않습니다.
-- 전처리 중 이메일, 전화번호, 주민번호가 포함된 row는 Q_score 계산 전에 제거됩니다.
-- 제거된 PII row는 `logs/security_audit.log`에 기록됩니다. 원문 개인정보는 남기지 않고 row id, PII 종류, 콘텐츠 해시만 남깁니다.
-- `logs/qa.jsonl`은 whitelist 방식으로 기록됩니다. 원문 질문/답변 대신 `query_sha256`, `answer_sha256`, 길이, 성공 여부, source, similarity, language만 저장합니다.
-- 응답에 `system prompt`, `developer message`, `ALTONG_API_KEY`, `REDIS_PASSWORD`, `internal secret`, `시스템 프롬프트` 같은 내부 키워드가 포함되면 `source="output_blocked"`로 차단됩니다.
-
-운영자가 확인할 파일:
+이번 구조에서는 LLM 답변 생성부가 분리되어 있습니다.
 
 ```text
-preprocess/pipeline.py          PII drop and security audit
-cache/redis_client.py           REDIS_PASSWORD authentication
-security/api_guard.py           local unauth bypass guard
-security/output_validator.py    internal keyword output block
-security/artifact_integrity.py  SHA-256 manifest write/verify
-model/train_lora.py             manifest generation after training
-pipeline/pipeline.py            whitelist qa logging and output guard
-api/server.py                   startup integrity check
+model/prompt.py
+  - 공통 prompt 생성 규칙
+
+model/inference.py
+  - 로컬 LLaMA/LoRA 직접 실행
+
+model/http_generator.py
+  - HTTP 모델 서버 호출
+
+model/generator_factory.py
+  - ALTONG_GENERATOR_MODE 값에 따라 local 또는 http 선택
+
+pipeline/pipeline.py
+  - cache, RAG, output validation 순서는 유지
+  - LLM 생성기만 교체 가능
 ```
 
-보안상 중요한 운영 순서:
+운영자는 보통 아래 둘 중 하나만 고르면 됩니다.
 
 ```powershell
-python -m preprocess.pipeline
-python -m preprocess.build_pairs
-python -m preprocess.build_triplet
-python -m intent.train
-python -m rag.embed
-python -m model.train_lora
-$env:REDIS_PASSWORD = "your_strong_password"
-$env:ALTONG_API_KEY = "local-secret-key"
-$env:ALTONG_ENV = "production"
-uvicorn api.server:app --host 127.0.0.1 --port 8000
+$env:ALTONG_GENERATOR_MODE = "local"
 ```
 
-`model.train_lora`를 다시 실행하거나 artifact 파일을 교체했다면 `artifacts/manifest.hash`도 새 artifact 기준으로 다시 생성되어야 합니다. manifest가 오래된 상태면 API 서버는 변조 가능성으로 보고 시작을 중단합니다.
-
-## 11. File Policy
-
-Git에 올리는 것:
-
-```text
-source code
-requirements.txt
-requirements.lock
-RUNBOOK.md
-IMPROVEMENTS.md
-PORTABLE_INDEX.md
-.gitignore
-```
-
-Git 밖에 두는 것:
-
-```text
-.env
-logs/
-artifacts/
-actual data/*.json
-hash manifest
-API keys
-HuggingFace token
-search API keys
-```
-
-자세한 기준은 `PORTABLE_INDEX.md`를 따릅니다.
-
-## 12. Quick Command Summary
-
-처음부터 빌드:
+또는:
 
 ```powershell
-python -m preprocess.pipeline
-python -m preprocess.build_pairs
-python -m preprocess.build_triplet
-python -m intent.train
-python -m rag.embed
-python -m model.train_lora
-```
-
-서버 실행:
-
-```powershell
-$env:REDIS_URL = "redis://localhost:6379/0"
-$env:REDIS_PASSWORD = "your_strong_password"
-$env:ALTONG_API_KEY = "local-secret-key"
-$env:ALTONG_RATE_LIMIT_PER_MINUTE = "60"
-uvicorn api.server:app --host 127.0.0.1 --port 8000
-```
-
-질문 테스트:
-
-```powershell
-Invoke-RestMethod `
-  -Method Post `
-  -Uri "http://localhost:8000/ask" `
-  -Headers @{"X-API-Key"="local-secret-key"} `
-  -ContentType "application/json" `
-  -Body '{"q":"질문내용","language":"ko"}'
-```
-
-재학습 후보 생성:
-
-```powershell
-python -m retrain.build_dataset
+$env:ALTONG_GENERATOR_MODE = "http"
+$env:ALTONG_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
 ```

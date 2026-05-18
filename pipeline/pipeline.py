@@ -10,7 +10,7 @@ import numpy as np
 
 from cache.redis_client import RedisCache
 from intent.infer import IntentMatcher
-from model.inference import LlamaAnswerGenerator
+from model.generator_factory import AnswerGenerator, create_answer_generator
 from rag.db import RetrievedDocument
 from rag.retriever import RagRetriever
 from security.output_validator import is_forbidden_output
@@ -39,7 +39,7 @@ class HybridQAPipeline:
         cache: RedisCache | None = None,
         intent_matcher: IntentMatcher | None = None,
         retriever: RagRetriever | None = None,
-        generator: LlamaAnswerGenerator | None = None,
+        generator: AnswerGenerator | None = None,
         log_path: str = "logs/qa.jsonl",
         rag_threshold: float = 0.7,
         cache_similarity_threshold: float = 0.9,
@@ -47,7 +47,7 @@ class HybridQAPipeline:
         self.cache = cache or RedisCache()
         self.intent_matcher = intent_matcher or IntentMatcher()
         self.retriever = retriever or RagRetriever(top_k=5)
-        self.generator = generator or LlamaAnswerGenerator()
+        self.generator = generator or create_answer_generator()
         self.log_path = Path(log_path)
         self.rag_threshold = rag_threshold
         self.cache_similarity_threshold = cache_similarity_threshold
