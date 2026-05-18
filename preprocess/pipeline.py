@@ -380,7 +380,6 @@ def _score_rows(rows: list[dict], sim_model: SentenceTransformer, ppl_scorer: Pp
     scored_rows = []
     for row, similarity, inverse_ppl in zip(rows, similarities, inverse_ppls):
         penalty = _length_penalty(str(row["answer"]))
-        # TODO: See PIPELINE_TODO.md for post-schema Gold scoring signals.
         q_score = (config.alpha * float(similarity)) + (config.beta * inverse_ppl) + (config.gamma * penalty)
         enriched = dict(row)
         enriched["sim_qa"] = float(similarity)
