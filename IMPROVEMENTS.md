@@ -41,7 +41,7 @@ Spring Boot 설정 예시:
 
 ```properties
 ai.api.base-url=http://10.x.x.x:8000
-ai.api.key=${ALTONG_AI_API_KEY}
+ai.api.key=${AI_API_KEY}
 ```
 
 권장 보안 설정:
