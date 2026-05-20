@@ -1,13 +1,13 @@
-# altong_ai 쉬운 운영 안내서
+# QA_special_Llama3_8b 쉬운 운영 안내서
 
-이 문서는 `altong_ai`를 한 대의 AI 서버에서 운영하는 방법을 설명합니다.
+이 문서는 `QA_special_Llama3_8b`를 한 대의 AI 서버에서 운영하는 방법을 설명합니다.
 
 목표는 단순합니다.
 
 ```text
 사용자
   -> Spring Boot 백엔드
-  -> altong_ai FastAPI /ask
+  -> QA_special_Llama3_8b FastAPI /ask
   -> Redis 캐시 확인
   -> RAG 문서 검색
   -> LLM 답변 생성
@@ -73,7 +73,7 @@ Redis는 캐시용입니다. 운영에서는 비밀번호를 걸어야 합니다
 예시:
 
 ```powershell
-docker run --name altong-redis -p 127.0.0.1:6379:6379 redis redis-server --requirepass your_strong_password
+docker run --name qa-redis -p 127.0.0.1:6379:6379 redis redis-server --requirepass your_strong_password
 ```
 
 서버 실행 전 같은 비밀번호를 환경변수로 넣습니다.
@@ -93,12 +93,12 @@ $env:REDIS_PASSWORD = "your_strong_password"
 운영에서는 아래 값을 지정합니다.
 
 ```powershell
-$env:ALTONG_ENV = "production"
-$env:ALTONG_API_KEY = "spring_boot_and_ai_server_shared_secret"
+$env:QA_ENV = "production"
+$env:QA_API_KEY = "spring_boot_and_ai_server_shared_secret"
 $env:REDIS_PASSWORD = "your_strong_password"
 ```
 
-`ALTONG_ENV`가 `production` 또는 `prod`이면 로컬 무인증 우회가 꺼집니다.
+`QA_ENV`가 `production` 또는 `prod`이면 로컬 무인증 우회가 꺼집니다.
 
 Spring Boot는 `/ask` 요청에 아래 header를 붙여야 합니다.
 
@@ -113,7 +113,7 @@ X-API-Key: spring_boot_and_ai_server_shared_secret
 별도 설정을 하지 않으면 기본값입니다.
 
 ```powershell
-$env:ALTONG_GENERATOR_MODE = "local"
+$env:QA_GENERATOR_MODE = "local"
 ```
 
 이 방식은 구조가 단순합니다. 대신 FastAPI 프로세스가 모델까지 직접 로드하므로 시작 시간이 길고 GPU 메모리를 크게 씁니다.
@@ -138,9 +138,9 @@ Model Server
 FastAPI에서 HTTP 모델 서버를 쓰려면 아래처럼 설정합니다.
 
 ```powershell
-$env:ALTONG_GENERATOR_MODE = "http"
-$env:ALTONG_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
-$env:ALTONG_MODEL_SERVER_TIMEOUT_SECONDS = "60"
+$env:QA_GENERATOR_MODE = "http"
+$env:QA_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
+$env:QA_MODEL_SERVER_TIMEOUT_SECONDS = "60"
 ```
 
 모델 서버는 JSON 응답에 아래 중 하나를 넣으면 됩니다.
@@ -248,7 +248,7 @@ python -m model.train_lora
 Redis가 먼저 떠 있어야 합니다.
 
 ```powershell
-docker start altong-redis
+docker start qa-redis
 ```
 
 ### 5.2 환경변수 설정
@@ -256,24 +256,24 @@ docker start altong-redis
 운영 예시:
 
 ```powershell
-$env:ALTONG_ENV = "production"
-$env:ALTONG_API_KEY = "spring_boot_and_ai_server_shared_secret"
+$env:QA_ENV = "production"
+$env:QA_API_KEY = "spring_boot_and_ai_server_shared_secret"
 $env:REDIS_PASSWORD = "your_strong_password"
-$env:ALTONG_GENERATOR_MODE = "local"
+$env:QA_GENERATOR_MODE = "local"
 ```
 
 HTTP 모델 서버를 쓸 때:
 
 ```powershell
-$env:ALTONG_GENERATOR_MODE = "http"
-$env:ALTONG_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
+$env:QA_GENERATOR_MODE = "http"
+$env:QA_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
 ```
 
 ### 5.3 모델 서버 실행
 
-`ALTONG_GENERATOR_MODE=local`이면 이 단계는 필요 없습니다.
+`QA_GENERATOR_MODE=local`이면 이 단계는 필요 없습니다.
 
-`ALTONG_GENERATOR_MODE=http`이면 FastAPI를 켜기 전에 모델 서버를 먼저 켭니다.
+`QA_GENERATOR_MODE=http`이면 FastAPI를 켜기 전에 모델 서버를 먼저 켭니다.
 
 모델 서버는 아래 정보를 받아 답변을 생성해야 합니다.
 
@@ -308,7 +308,7 @@ Spring Boot 서버 IP만 `8000` 포트에 접근할 수 있게 두는 것이 좋
 Invoke-RestMethod `
   -Method Post `
   -Uri "http://localhost:8000/ask" `
-  -Headers @{ "X-API-Key" = $env:ALTONG_API_KEY } `
+  -Headers @{ "X-API-Key" = $env:QA_API_KEY } `
   -ContentType "application/json" `
   -Body '{"q":"테스트 질문입니다","language":"ko"}'
 ```
@@ -463,11 +463,11 @@ embedding 모델을 바꾸면 기존 FAISS index와 semantic cache는 같은 기
 
 정기적으로 확인할 것:
 
-- `ALTONG_API_KEY`가 Git에 들어가지 않았는지 확인
+- `QA_API_KEY`가 Git에 들어가지 않았는지 확인
 - `REDIS_PASSWORD`가 Git에 들어가지 않았는지 확인
 - Redis가 외부에 열려 있지 않은지 확인
 - FastAPI `8000` 포트가 Spring Boot 서버에서만 접근 가능한지 확인
-- `ALTONG_ENV=production`이 운영 서버에 설정되어 있는지 확인
+- `QA_ENV=production`이 운영 서버에 설정되어 있는지 확인
 
 ### 9.4 성능 관리
 
@@ -548,12 +548,12 @@ artifact manifest verification failed
 
 ### 10.4 모델 서버 응답 실패
 
-`ALTONG_GENERATOR_MODE=http`일 때만 해당합니다.
+`QA_GENERATOR_MODE=http`일 때만 해당합니다.
 
 확인:
 
 ```powershell
-$env:ALTONG_MODEL_SERVER_URL
+$env:QA_MODEL_SERVER_URL
 ```
 
 해결:
@@ -561,7 +561,7 @@ $env:ALTONG_MODEL_SERVER_URL
 - 모델 서버가 먼저 떠 있는지 확인
 - `/generate` endpoint가 POST JSON을 받는지 확인
 - 응답에 `answer`, `text`, `generated_text`, 또는 `choices[0].message.content`가 있는지 확인
-- timeout이 너무 짧으면 `ALTONG_MODEL_SERVER_TIMEOUT_SECONDS`를 늘림
+- timeout이 너무 짧으면 `QA_MODEL_SERVER_TIMEOUT_SECONDS`를 늘림
 
 ### 10.5 답변이 보안 검사에서 차단됨
 
@@ -587,8 +587,8 @@ $env:ALTONG_MODEL_SERVER_URL
 - [ ] Python 가상환경 생성
 - [ ] `pip install -r requirements.txt`
 - [ ] Redis 비밀번호 설정
-- [ ] `ALTONG_API_KEY` 설정
-- [ ] `ALTONG_ENV=production` 설정
+- [ ] `QA_API_KEY` 설정
+- [ ] `QA_ENV=production` 설정
 - [ ] 데이터 정제 실행
 - [ ] intent 학습 실행
 - [ ] RAG index 생성
@@ -633,7 +633,7 @@ model/http_generator.py
   - HTTP 모델 서버 호출
 
 model/generator_factory.py
-  - ALTONG_GENERATOR_MODE 값에 따라 local 또는 http 선택
+  - QA_GENERATOR_MODE 값에 따라 local 또는 http 선택
 
 pipeline/pipeline.py
   - cache, RAG, output validation 순서는 유지
@@ -643,12 +643,12 @@ pipeline/pipeline.py
 운영자는 보통 아래 둘 중 하나만 고르면 됩니다.
 
 ```powershell
-$env:ALTONG_GENERATOR_MODE = "local"
+$env:QA_GENERATOR_MODE = "local"
 ```
 
 또는:
 
 ```powershell
-$env:ALTONG_GENERATOR_MODE = "http"
-$env:ALTONG_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
+$env:QA_GENERATOR_MODE = "http"
+$env:QA_MODEL_SERVER_URL = "http://127.0.0.1:9000/generate"
 ```
