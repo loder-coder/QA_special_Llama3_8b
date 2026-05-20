@@ -1,6 +1,6 @@
 # Improvement Notes
 
-이 문서는 현재 `altong_ai`를 로컬 싱글 노드 AI 서버로 운영한다는 전제에서, 운영 전에 검토하거나 단계적으로 추가할 개선 사항을 정리합니다.
+이 문서는 현재 `QA_special_Llama3_8b`를 로컬 싱글 노드 AI 서버로 운영한다는 전제에서, 운영 전에 검토하거나 단계적으로 추가할 개선 사항을 정리합니다.
 
 ## 1. Target Service Flow
 
@@ -10,7 +10,7 @@
 User / Frontend
   -> Spring Boot Backend
   -> Internal IP JSON API
-  -> altong_ai Single Node
+  -> QA_special_Llama3_8b Single Node
      - FastAPI
      - Redis localhost
      - FAISS index
@@ -54,7 +54,7 @@ ai.api.key=${ALTONG_AI_API_KEY}
 내부 DNS를 쓰는 경우:
 
 ```text
-http://altong-ai.internal:8000/ask
+http://qa-llama3.internal:8000/ask
 ```
 
 내부 DNS는 IP 변경 대응에는 좋지만, 외부 공개 DNS와 혼동하지 않아야 합니다.
@@ -246,7 +246,7 @@ REDIS_URL=redis://localhost:6379/0
 
 - [ ] AI 서버 고정 내부 IP 설정
 - [ ] Spring Boot 서버 IP만 AI 서버 `8000` 포트 접근 허용
-- [ ] `ALTONG_API_KEY` 설정
+- [ ] `QA_API_KEY` 설정
 - [ ] Spring Boot에서 `X-API-Key` 헤더 전송
 - [ ] Redis는 `localhost:6379`로만 접근
 - [ ] 포터블 보관 대상과 Git 제외 대상은 `PORTABLE_INDEX.md` 기준으로 확인
@@ -270,3 +270,32 @@ REDIS_URL=redis://localhost:6379/0
 - [ ] Redis 기반 rate limit 검토
 - [ ] 평균 latency, cache hit ratio, LLM call ratio 로그 집계
 - [ ] 재학습 후보 승인 프로세스 문서화
+
+## 10. RAG 대안 구조 검토 — 터미널 기반 문서 읽기
+
+현재 RAG 파이프라인은 싱글 노드에서 LLM과 임베딩 모델이 메모리를 나눠 쓰는 구조입니다.
+
+문제:
+
+- LLM(Llama3 8B)과 임베딩 모델(FAISS + SentenceTransformer)이 동시에 메모리에 올라가면 GPU/RAM 경합이 발생합니다.
+- 싱글 노드 환경에서는 임베딩 모델 자체가 병목이 될 수 있습니다.
+
+검토한 대안:
+
+LLM이 직접 파일 시스템을 읽는 방식 (터미널/bash 기반 문서 접근) 을 사고실험 수준에서 검토했습니다. 임베딩 모델을 아예 제거하고, LLM이 필요한 문서를 직접 읽어 컨텍스트를 구성하는 구조입니다. SWE-agent 계열 논문에서 모델이 리눅스 터미널을 직접 조작하며 정보를 수집하는 방식이 이 방향에 해당합니다.
+
+현재 구조를 유지한 이유:
+
+- 컨텍스트 길이 제한: Llama3 8B의 컨텍스트 윈도우 안에 문서 전체를 넣기 어렵습니다.
+- 응답 지연: 파일 읽기 → 파싱 → 컨텍스트 조합 과정이 RAG 검색보다 느릴 수 있습니다.
+- 운영 리스크: LLM이 파일 시스템에 직접 접근하면 보안 경계가 복잡해집니다.
+
+현재 선택:
+
+임베딩 모델 호출 자체를 줄이기 위해 Redis 시맨틱 캐시 레이어를 앞단에 두는 방식으로 메모리 경합 문제를 완화하고 있습니다. 하드웨어 자원이 확보되거나 멀티 노드 구조로 전환되면 임베딩 서버 분리를 먼저 검토합니다.
+
+향후 검토 방향:
+
+- 임베딩 서버를 별도 프로세스로 분리해 LLM과 메모리 경합을 줄이기
+- 컨텍스트 윈도우가 큰 모델로 교체 시 터미널 기반 문서 접근 방식 재검토
+- Tool use / function calling 기반으로 LLM이 필요한 문서만 선택적으로 읽는 구조 실험
