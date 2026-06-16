@@ -84,7 +84,7 @@ pip install -r requirements.txt
 docker run --name qa-redis -p 127.0.0.1:6379:6379 redis redis-server --requirepass your_password
 
 # 환경변수 설정
-export ALTONG_API_KEY=your_api_key
+export LLAMA_API_KEY=your_api_key
 export REDIS_PASSWORD=your_password
 
 # 데이터 준비 및 인덱스 생성
